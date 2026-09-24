@@ -11,6 +11,11 @@ export {
   encodeWelcome,
   encodePing,
   encodePong,
-  encodeMessage,
+  encodeSyncStep1,
+  encodeSyncStep2,
+  encodeDocUpdate,
+  encodePresenceUpdate,
+  encodePresenceBroadcast,
+  encodePresenceRemove,
   type DecodedMessage,
 } from './codec.js';

@@ -29,10 +29,31 @@ export const MessageType = {
   Ping: 0x03,
   /** client -> server: liveness reply. */
   Pong: 0x04,
-  /** either direction: opaque room payload, rebroadcast to other room
-   * members as-is. Phase 1 uses this only to prove the broadcast plumbing
-   * works; Phase 2 gives it real meaning (Yjs updates, presence). */
-  Message: 0x05,
+
+  /** client -> server, once per connection right after WELCOME: "here is
+   * my Yjs state vector, send me what I'm missing." Also how a Phase 4
+   * reconnect resyncs after a gap, rather than needing a fresh full doc. */
+  SyncStep1: 0x10,
+  /** server -> client, reply to SyncStep1: a Yjs update containing only
+   * what the client's state vector didn't already have. */
+  SyncStep2: 0x11,
+  /** either direction: a Yjs document update. Commutative and idempotent
+   * (see room/Room.ts), so the server can apply-then-rebroadcast without
+   * caring about arrival order or duplicate delivery. */
+  DocUpdate: 0x12,
+
+  /** client -> server: this client's own cursor/selection/name/colour.
+   * Carries no ID or timestamp — the server stamps both on receipt (see
+   * docs/adr/0001-presence-lww-set.md for why client-supplied timestamps
+   * are unsafe here). */
+  PresenceUpdate: 0x20,
+  /** server -> client: a presence entry (someone's cursor moved, or this
+   * is part of the snapshot a newly-joined client gets of who's already
+   * in the room). */
+  PresenceBroadcast: 0x21,
+  /** server -> client: a presence entry was removed (its owner
+   * disconnected). */
+  PresenceRemove: 0x22,
 } as const;
 
 export type MessageType = (typeof MessageType)[keyof typeof MessageType];

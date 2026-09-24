@@ -20,7 +20,8 @@
   "dependencies": {
     "fastify": "^5.1.0",
     "pino": "^9.5.0",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "yjs": "^13.6.33"
   },
   "devDependencies": {
     "@eslint/js": "^9.15.0",

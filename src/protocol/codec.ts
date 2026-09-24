@@ -1,3 +1,4 @@
+import type { PresenceValue } from '../presence/types.js';
 import { MessageType, PROTOCOL_VERSION } from './types.js';
 
 /** Thrown by decode() on any malformed frame. The gateway catches this at a
@@ -16,6 +17,39 @@ function writeString(chunks: Uint8Array[], value: string): void {
   const len = new Uint8Array(2);
   new DataView(len.buffer).setUint16(0, bytes.length, false);
   chunks.push(len, bytes);
+}
+
+function writeU32(chunks: Uint8Array[], value: number): void {
+  const bytes = new Uint8Array(4);
+  new DataView(bytes.buffer).setUint32(0, value, false);
+  chunks.push(bytes);
+}
+
+/** Timestamps are epoch milliseconds (Date.now()-range), which overflows
+ * u32 — encoded as u64 on the wire but kept as `number` everywhere in TS,
+ * since epoch-ms values are always well within Number.MAX_SAFE_INTEGER. */
+function writeU64(chunks: Uint8Array[], value: number): void {
+  const bytes = new Uint8Array(8);
+  new DataView(bytes.buffer).setBigUint64(0, BigInt(value), false);
+  chunks.push(bytes);
+}
+
+function writePresenceValue(chunks: Uint8Array[], value: PresenceValue): void {
+  writeString(chunks, value.displayName);
+  writeString(chunks, value.color);
+  if (value.cursor === null) {
+    chunks.push(new Uint8Array([0]));
+  } else {
+    chunks.push(new Uint8Array([1]));
+    writeU32(chunks, value.cursor);
+  }
+  if (value.selection === null) {
+    chunks.push(new Uint8Array([0]));
+  } else {
+    chunks.push(new Uint8Array([1]));
+    writeU32(chunks, value.selection.anchor);
+    writeU32(chunks, value.selection.head);
+  }
 }
 
 function concat(chunks: Uint8Array[]): Uint8Array {
@@ -53,6 +87,24 @@ class Reader {
     return v;
   }
 
+  u32(): number {
+    if (this.remaining < 4) throw new ProtocolDecodeError('truncated: expected u32');
+    const v = this.#view.getUint32(this.#offset, false);
+    this.#offset += 4;
+    return v;
+  }
+
+  u64(): number {
+    if (this.remaining < 8) throw new ProtocolDecodeError('truncated: expected u64');
+    const v = this.#view.getBigUint64(this.#offset, false);
+    this.#offset += 8;
+    return Number(v);
+  }
+
+  bool(): boolean {
+    return this.u8() !== 0;
+  }
+
   string(): string {
     if (this.remaining < 2) throw new ProtocolDecodeError('truncated: expected string length');
     const len = this.#view.getUint16(this.#offset, false);
@@ -61,6 +113,14 @@ class Reader {
     const bytes = this.#bytes.subarray(this.#offset, this.#offset + len);
     this.#offset += len;
     return textDecoder.decode(bytes);
+  }
+
+  presenceValue(): PresenceValue {
+    const displayName = this.string();
+    const color = this.string();
+    const cursor = this.bool() ? this.u32() : null;
+    const selection = this.bool() ? { anchor: this.u32(), head: this.u32() } : null;
+    return { displayName, color, cursor, selection };
   }
 
   rest(): Uint8Array {
@@ -79,7 +139,12 @@ export type DecodedMessage =
   | { type: typeof MessageType.Welcome; clientId: string }
   | { type: typeof MessageType.Ping }
   | { type: typeof MessageType.Pong }
-  | { type: typeof MessageType.Message; payload: Uint8Array };
+  | { type: typeof MessageType.SyncStep1; stateVector: Uint8Array }
+  | { type: typeof MessageType.SyncStep2; update: Uint8Array }
+  | { type: typeof MessageType.DocUpdate; update: Uint8Array }
+  | { type: typeof MessageType.PresenceUpdate; value: PresenceValue }
+  | { type: typeof MessageType.PresenceBroadcast; clientId: string; timestamp: number; value: PresenceValue }
+  | { type: typeof MessageType.PresenceRemove; clientId: string; timestamp: number };
 
 export function encodeHello(roomId: string, protocolVersion = PROTOCOL_VERSION): Uint8Array {
   const chunks: Uint8Array[] = [new Uint8Array([MessageType.Hello, protocolVersion])];
@@ -101,8 +166,37 @@ export function encodePong(): Uint8Array {
   return new Uint8Array([MessageType.Pong]);
 }
 
-export function encodeMessage(payload: Uint8Array): Uint8Array {
-  return concat([new Uint8Array([MessageType.Message]), payload]);
+export function encodeSyncStep1(stateVector: Uint8Array): Uint8Array {
+  return concat([new Uint8Array([MessageType.SyncStep1]), stateVector]);
+}
+
+export function encodeSyncStep2(update: Uint8Array): Uint8Array {
+  return concat([new Uint8Array([MessageType.SyncStep2]), update]);
+}
+
+export function encodeDocUpdate(update: Uint8Array): Uint8Array {
+  return concat([new Uint8Array([MessageType.DocUpdate]), update]);
+}
+
+export function encodePresenceUpdate(value: PresenceValue): Uint8Array {
+  const chunks: Uint8Array[] = [new Uint8Array([MessageType.PresenceUpdate])];
+  writePresenceValue(chunks, value);
+  return concat(chunks);
+}
+
+export function encodePresenceBroadcast(clientId: string, timestamp: number, value: PresenceValue): Uint8Array {
+  const chunks: Uint8Array[] = [new Uint8Array([MessageType.PresenceBroadcast])];
+  writeString(chunks, clientId);
+  writeU64(chunks, timestamp);
+  writePresenceValue(chunks, value);
+  return concat(chunks);
+}
+
+export function encodePresenceRemove(clientId: string, timestamp: number): Uint8Array {
+  const chunks: Uint8Array[] = [new Uint8Array([MessageType.PresenceRemove])];
+  writeString(chunks, clientId);
+  writeU64(chunks, timestamp);
+  return concat(chunks);
 }
 
 export function decode(bytes: Uint8Array): DecodedMessage {
@@ -127,9 +221,24 @@ export function decode(bytes: Uint8Array): DecodedMessage {
       return { type: MessageType.Ping };
     case MessageType.Pong:
       return { type: MessageType.Pong };
-    case MessageType.Message: {
-      const payload = reader.rest();
-      return { type: MessageType.Message, payload };
+    case MessageType.SyncStep1:
+      return { type: MessageType.SyncStep1, stateVector: reader.rest() };
+    case MessageType.SyncStep2:
+      return { type: MessageType.SyncStep2, update: reader.rest() };
+    case MessageType.DocUpdate:
+      return { type: MessageType.DocUpdate, update: reader.rest() };
+    case MessageType.PresenceUpdate:
+      return { type: MessageType.PresenceUpdate, value: reader.presenceValue() };
+    case MessageType.PresenceBroadcast: {
+      const clientId = reader.string();
+      const timestamp = reader.u64();
+      const value = reader.presenceValue();
+      return { type: MessageType.PresenceBroadcast, clientId, timestamp, value };
+    }
+    case MessageType.PresenceRemove: {
+      const clientId = reader.string();
+      const timestamp = reader.u64();
+      return { type: MessageType.PresenceRemove, clientId, timestamp };
     }
     default:
       throw new ProtocolDecodeError(`unknown message type: 0x${type.toString(16)}`);
