@@ -9,7 +9,7 @@ export class ProtocolDecodeError extends Error {}
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
-function writeString(chunks: Uint8Array[], value: string): void {
+export function writeString(chunks: Uint8Array[], value: string): void {
   const bytes = textEncoder.encode(value);
   if (bytes.length > 0xffff) {
     throw new ProtocolDecodeError(`string field too long: ${bytes.length} bytes`);
@@ -19,7 +19,7 @@ function writeString(chunks: Uint8Array[], value: string): void {
   chunks.push(len, bytes);
 }
 
-function writeU32(chunks: Uint8Array[], value: number): void {
+export function writeU32(chunks: Uint8Array[], value: number): void {
   const bytes = new Uint8Array(4);
   new DataView(bytes.buffer).setUint32(0, value, false);
   chunks.push(bytes);
@@ -52,7 +52,7 @@ function writePresenceValue(chunks: Uint8Array[], value: PresenceValue): void {
   }
 }
 
-function concat(chunks: Uint8Array[]): Uint8Array {
+export function concat(chunks: Uint8Array[]): Uint8Array {
   const total = chunks.reduce((sum, c) => sum + c.length, 0);
   const out = new Uint8Array(total);
   let offset = 0;
@@ -66,7 +66,7 @@ function concat(chunks: Uint8Array[]): Uint8Array {
 /** Cursor over a Uint8Array with bounds-checked reads. Every read throws
  * ProtocolDecodeError instead of returning undefined/NaN on a truncated
  * buffer, so decode() never has to null-check its way through a payload. */
-class Reader {
+export class Reader {
   #view: DataView;
   #bytes: Uint8Array;
   #offset = 0;
@@ -121,6 +121,13 @@ class Reader {
     const cursor = this.bool() ? this.u32() : null;
     const selection = this.bool() ? { anchor: this.u32(), head: this.u32() } : null;
     return { displayName, color, cursor, selection };
+  }
+
+  bytes(length: number): Uint8Array {
+    if (this.remaining < length) throw new ProtocolDecodeError('truncated: expected bytes');
+    const out = this.#bytes.subarray(this.#offset, this.#offset + length);
+    this.#offset += length;
+    return out;
   }
 
   rest(): Uint8Array {
