@@ -3,6 +3,9 @@ import {
   DEFAULT_RECONNECT_POLICY,
   backoffDelay,
   classifyClose,
+  displayStatus,
+  isLive,
+  livenessTimeoutMs,
   step,
   type ConnectionEvent,
   type ConnectionState,
@@ -203,5 +206,64 @@ describe('connection state machine', () => {
         state = t.state;
       }
     }
+  });
+});
+
+describe('liveness', () => {
+  it('allows a missed ping plus slack, and no more', () => {
+    const timeout = livenessTimeoutMs(15_000);
+    expect(timeout).toBeGreaterThan(15_000); // one missed ping is tolerated
+    expect(timeout).toBeLessThan(15_000 * 2); // two are not
+  });
+
+  it('treats a connection as live up to and including the timeout', () => {
+    expect(isLive(1000, 0, 1000)).toBe(true);
+    expect(isLive(1001, 0, 1000)).toBe(false);
+  });
+
+  it('abandons a silent connection to a backoff retry and remembers it was suspected offline', () => {
+    const t = run([{ type: 'start' }, { type: 'welcome' }, { type: 'liveness-lost' }]);
+    expect(t[2]!.state).toMatchObject({ status: 'reconnecting', failures: 1, suspectedOffline: true });
+    expect(t[2]!.effect.kind).toBe('schedule-retry');
+  });
+
+  it('keeps reporting offline through the retries until a handshake actually completes', () => {
+    const t = run([
+      { type: 'start' },
+      { type: 'welcome' },
+      { type: 'liveness-lost' },
+      { type: 'retry-due' },
+      { type: 'closed', code: 1006 }, // the retry fails too
+      { type: 'retry-due' },
+      { type: 'welcome' },
+    ]);
+    expect(displayStatus(t[2]!.state)).toBe('offline');
+    expect(displayStatus(t[3]!.state)).toBe('offline');
+    expect(displayStatus(t[4]!.state)).toBe('offline');
+    expect(displayStatus(t[5]!.state)).toBe('offline');
+    expect(t[6]!.state).toEqual({ status: 'connected' });
+    expect(displayStatus(t[6]!.state)).toBe('connected');
+  });
+
+  it('does not call an ordinary server-side close "offline"', () => {
+    const t = run([{ type: 'start' }, { type: 'welcome' }, { type: 'closed', code: CloseCode.HeartbeatTimeout }]);
+    expect(displayStatus(t[2]!.state)).toBe('reconnecting');
+  });
+
+  it('ignores liveness loss when not connected or connecting', () => {
+    expect(step({ status: 'idle' }, { type: 'liveness-lost' }, lo, policy).effect).toEqual({ kind: 'none' });
+    expect(step({ status: 'failed', reason: 'superseded' }, { type: 'liveness-lost' }, lo, policy).effect).toEqual({ kind: 'none' });
+  });
+});
+
+describe('displayStatus', () => {
+  it('maps every state to what a user should see', () => {
+    expect(displayStatus({ status: 'idle' })).toBe('connecting');
+    expect(displayStatus({ status: 'connecting', failures: 0 })).toBe('connecting');
+    expect(displayStatus({ status: 'connecting', failures: 2 })).toBe('reconnecting');
+    expect(displayStatus({ status: 'connected' })).toBe('connected');
+    expect(displayStatus({ status: 'reconnecting', failures: 1, delayMs: 5 })).toBe('reconnecting');
+    expect(displayStatus({ status: 'offline' })).toBe('offline');
+    expect(displayStatus({ status: 'failed', reason: 'version-mismatch' })).toBe('failed');
   });
 });

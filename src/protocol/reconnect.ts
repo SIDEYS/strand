@@ -80,11 +80,17 @@ export function backoffDelay(failures: number, random: () => number, policy: Rec
   return Math.floor(half + random() * half);
 }
 
+/**
+ * `suspectedOffline` is set when the connection was abandoned because it went
+ * silent (see isLive), not because the server closed it. It stays set across
+ * the retries that follow, and clears only on a completed handshake, so the
+ * UI can say "offline" while we are still trying to get back.
+ */
 export type ConnectionState =
   | { status: 'idle' }
-  | { status: 'connecting'; failures: number }
+  | { status: 'connecting'; failures: number; suspectedOffline?: true }
   | { status: 'connected' }
-  | { status: 'reconnecting'; failures: number; delayMs: number }
+  | { status: 'reconnecting'; failures: number; delayMs: number; suspectedOffline?: true }
   | { status: 'offline' }
   | { status: 'failed'; reason: FailureReason };
 
@@ -92,6 +98,9 @@ export type ConnectionEvent =
   | { type: 'start' }
   | { type: 'welcome' }
   | { type: 'closed'; code: number }
+  /** The connection has gone silent for longer than the server's heartbeat
+   * allows: it is open but useless. */
+  | { type: 'liveness-lost' }
   | { type: 'network'; online: boolean }
   | { type: 'retry-due' }
   | { type: 'manual-reconnect' };
@@ -139,15 +148,35 @@ export function step(
         verdict.class === 'immediate' && failures === 1
           ? Math.floor(random() * policy.immediateJitterMs)
           : backoffDelay(failures, random, policy);
+      // A failed attempt while we already suspect the network is down is
+      // more of the same, not evidence it is back.
+      const suspected = state.status === 'connecting' && state.suspectedOffline === true;
       return {
-        state: { status: 'reconnecting', failures, delayMs },
+        state: { status: 'reconnecting', failures, delayMs, ...(suspected ? { suspectedOffline: true as const } : {}) },
+        effect: { kind: 'schedule-retry', delayMs },
+      };
+    }
+
+    case 'liveness-lost': {
+      if (state.status !== 'connected' && state.status !== 'connecting') return { state, effect: NONE };
+      const failures = (state.status === 'connecting' ? state.failures : 0) + 1;
+      const delayMs = backoffDelay(failures, random, policy);
+      return {
+        state: { status: 'reconnecting', failures, delayMs, suspectedOffline: true },
         effect: { kind: 'schedule-retry', delayMs },
       };
     }
 
     case 'retry-due':
       if (state.status !== 'reconnecting') return { state, effect: NONE };
-      return { state: { status: 'connecting', failures: state.failures }, effect: { kind: 'connect' } };
+      return {
+        state: {
+          status: 'connecting',
+          failures: state.failures,
+          ...(state.suspectedOffline ? { suspectedOffline: true as const } : {}),
+        },
+        effect: { kind: 'connect' },
+      };
 
     case 'network':
       if (!event.online) {
@@ -167,4 +196,48 @@ export function step(
       }
       return { state: { status: 'connecting', failures: 0 }, effect: { kind: 'connect' } };
   }
+}
+
+export type DisplayStatus = 'connecting' | 'connected' | 'reconnecting' | 'offline' | 'failed';
+
+/**
+ * What the UI should say. "Offline" means the connection is useless, whether
+ * the browser reported the network down or the link merely went silent, and
+ * is deliberately independent of whether the socket has noticed yet.
+ */
+export function displayStatus(state: ConnectionState): DisplayStatus {
+  switch (state.status) {
+    case 'idle':
+      return 'connecting';
+    case 'connected':
+      return 'connected';
+    case 'offline':
+      return 'offline';
+    case 'failed':
+      return 'failed';
+    case 'connecting':
+      if (state.suspectedOffline) return 'offline';
+      return state.failures === 0 ? 'connecting' : 'reconnecting';
+    case 'reconnecting':
+      return state.suspectedOffline ? 'offline' : 'reconnecting';
+  }
+}
+
+/**
+ * How long a connection may stay silent before it is treated as dead.
+ *
+ * The server pings every `heartbeatIntervalMs`, so a healthy connection hears
+ * something at least that often. One missed ping plus slack for jitter and
+ * scheduling is allowed; beyond that the link is useless regardless of what
+ * the socket believes (a socket can stay "open" through a dead network for a
+ * long time). The cost of this design is detection latency: roughly 1.5
+ * heartbeat intervals. A shorter server interval buys faster detection with
+ * more traffic.
+ */
+export function livenessTimeoutMs(heartbeatIntervalMs: number): number {
+  return Math.ceil(heartbeatIntervalMs * 1.5) + 1000;
+}
+
+export function isLive(nowMs: number, lastHeardAtMs: number, timeoutMs: number): boolean {
+  return nowMs - lastHeardAtMs <= timeoutMs;
 }
