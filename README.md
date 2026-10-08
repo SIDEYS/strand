@@ -66,6 +66,53 @@ Looping on a version mismatch would be a denial of service against your own
 server, and two tabs that each reconnected after being superseded would evict
 each other forever.
 
+## Persistence
+
+Rooms live in instance memory and are written to Postgres **behind** the edit
+path: a keystroke never waits on the database. Each instance writes an update
+to the op log only when one of *its own* clients produced it, so every edit is
+logged exactly once with no election, lease, or deduplication. Any instance can
+write a snapshot (a merge of the stored one and its own state, guarded by
+compare-and-set on a version), which is what covers an originator that dies
+before its buffer is flushed. The op log is unordered because Yjs updates
+commute; each op is tagged with the snapshot version current when it was
+written, and compaction drops ops older than a configurable number of versions
+behind the newest snapshot. Details and trade-offs are in
+[ADR 0004](docs/adr/0004-write-behind-persistence.md).
+
+**The durability window, stated plainly.** Because writing is behind the edit
+path, a crash can lose the most recent edits from the log: ops reach Postgres
+up to 250 ms (`PERSIST_FLUSH_INTERVAL_MS`) after the edit. If another instance
+also held the change, it snapshots it within `SNAPSHOT_INTERVAL_MS` (30 s) and
+nothing is lost; if the dying instance was the only holder, up to roughly
+250 ms of its clients' typing is gone. Tuning the flush and snapshot intervals
+narrows this; nothing removes it. A graceful shutdown flushes everything. While
+Postgres is unreachable, edits continue and memory is the only copy.
+
+### Cold recovery, measured
+
+Rebuilding one room's document from Postgres with nothing in memory and Redis
+flushed (`node loadtest/recovery-bench.mjs`; Postgres 16 in Docker on the same
+machine, Apple M4, Node 24, 7 runs per row with the first included):
+
+| Scenario | Doc chars | Snapshot | Op rows | Op bytes | min ms | median ms | max ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| snapshot only | 39,382 | 89,496 B | 0 | 0 B | 2.7 | 2.8 | 4.2 |
+| snapshot + 120 op rows | 44,528 | 88,471 B | 120 | 17,393 B | 2.8 | 3.1 | 3.8 |
+| snapshot + 1,000 op rows | 82,825 | 91,060 B | 1,000 | 143,785 B | 8.9 | 10.7 | 12.5 |
+| snapshot + 10,000 op rows | 475,072 | 89,693 B | 10,000 | 1,445,302 B | 1400.5 | 1547.0 | 1628.0 |
+| no snapshot, content as ~1,000 op rows | 39,050 | 0 B | 893 | 124,255 B | 8.8 | 9.6 | 13.6 |
+| no snapshot, one op row per edit | 38,909 | 0 B | 7,143 | 185,070 B | 12.6 | 13.4 | 21.5 |
+
+With the default settings a document keeps at most a few hundred op rows
+between snapshots, so a typical recovery is the first three rows: between about 3 and 11
+milliseconds for a document of tens of thousands of characters. The 10,000-row
+case is a stress scenario well past what retention allows, and its cost is
+replaying roughly 80,000 edits into a 475,000-character document. These are
+localhost figures: against a managed database add one network round trip for
+the snapshot query and one for the ops query. Each scenario verifies that the
+recovered state matches what was written before it is timed.
+
 ## What has been verified
 
 All against a real Redis in a container, not mocks. Numbers below are what the
@@ -100,8 +147,25 @@ tests and runs actually produced.
   discarded, the stale connection still stops itself via its heartbeat lease
   check; removing that check fails the test.
 
-The suites that involve timing were run repeatedly: the replication suite 20
-times and the resume suites 20 times with no failures.
+- **Each edit is logged once, by the instance that originated it.** With two
+  instances and a client on each, the rows written by one instance rebuild
+  exactly its client's typing and the other's exactly the other's; no instance
+  logged what it received from a peer.
+- **A dying originator does not lose the change if a peer holds it.** The
+  originator is killed with the op still in its buffer; the op log is
+  verifiably empty for that document, and the peer's snapshot alone brings the
+  change back on a cold start.
+- **Cold restart with Redis flushed.** After every instance stops and Redis is
+  wiped, a new instance serves the document with an identical state vector.
+  Three instances taking 40% message loss while snapshotting every 8 changes
+  and compacting aggressively recover the converged text from Postgres alone.
+- **Postgres is off the edit path.** With every database write held open,
+  clients still see each other's edits immediately, and a hung database read
+  does not stop a room from opening.
+
+The suites that involve timing were run repeatedly with no failures: the
+replication suite 20 times, the resume suites 20 times, and the persistence
+suites (24 tests) 15 times.
 
 ## Running
 
@@ -112,13 +176,15 @@ cp .env.example .env
 # Every instance must share one resume secret (required when REDIS_URL is set):
 echo "RESUME_SECRET=$(openssl rand -base64 32)" >> .env
 npm run build
+# Create the tables (reads DATABASE_URL):
+DATABASE_URL=postgres://strand:strand@localhost:5432/strand npm run migrate
 # several instances against one Redis, on different ports:
 PORT=8081 node --env-file=.env dist/index.js &
 PORT=8082 node --env-file=.env dist/index.js &
 ```
 
 Without `REDIS_URL` a single instance runs standalone and generates a
-throwaway resume secret.
+throwaway resume secret. Without `DATABASE_URL` nothing is persisted.
 
 ## Tests
 
@@ -136,6 +202,38 @@ explicitly:
 export DOCKER_HOST=unix://$HOME/.docker/run/docker.sock
 export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock
 ```
+
+## Limitations
+
+These are known and deliberate, not oversights.
+
+- **Redis outage weakens identity uniqueness.** One live connection per client
+  ID is enforced against a lease in Redis. While Redis is unreachable, that
+  check can only see connections on the same instance, so the same resume
+  token presented on two different instances can be admitted twice until Redis
+  returns and the heartbeat lease check fences one of them. I chose to degrade
+  uniqueness rather than refuse connections: refusing to let people connect
+  because the coordination layer is down turns a partial outage into a total
+  one. The cost is a brief period of two tabs acting as one person (their
+  edits merge harmlessly; a stale cursor can linger for about one heartbeat).
+- **Durability window.** Write-behind persistence can lose the most recent
+  ~250 ms of edits when the only instance holding them crashes (see
+  Persistence above), and edits made during a Postgres outage exist only in
+  memory until it returns.
+- **Rooms are memory-bound per instance.** A room's document is held whole in
+  memory on every instance hosting it, and a snapshot rewrites it whole. There
+  is no paging, and no limit on document size beyond the inbound message cap.
+- **No authentication and no per-document access control.** Anyone who can
+  reach the service and knows a room ID can read and edit that room's
+  document. Resume tokens are not revocable and grant nothing beyond reclaiming
+  a client ID; this is only acceptable because there is nothing to protect
+  (ADR 0003).
+- **The op log and document history grow.** Compaction bounds the log, but a
+  document's CRDT history only grows as it is edited, documents are never
+  deleted, and every snapshot stores the whole document.
+- **Compaction safety is a timing assumption, not a proof.** It relies on
+  instances holding a change snapshotting within a bounded time; the narrow
+  conditions under which a change could be lost are in ADR 0004.
 
 ## License
 
