@@ -34,6 +34,19 @@ export function writeU64(chunks: Uint8Array[], value: number): void {
   chunks.push(bytes);
 }
 
+/** Longest encoded relative position accepted. They are ~10-20 bytes; the cap
+ * just keeps a hostile length prefix from being believed. */
+const MAX_POSITION_BYTES = 256;
+
+function writePosition(chunks: Uint8Array[], position: Uint8Array): void {
+  if (position.length > MAX_POSITION_BYTES) {
+    throw new ProtocolDecodeError(`position too long: ${position.length} bytes`);
+  }
+  const len = new Uint8Array(2);
+  new DataView(len.buffer).setUint16(0, position.length, false);
+  chunks.push(len, position);
+}
+
 function writePresenceValue(chunks: Uint8Array[], value: PresenceValue): void {
   writeString(chunks, value.displayName);
   writeString(chunks, value.color);
@@ -41,14 +54,14 @@ function writePresenceValue(chunks: Uint8Array[], value: PresenceValue): void {
     chunks.push(new Uint8Array([0]));
   } else {
     chunks.push(new Uint8Array([1]));
-    writeU32(chunks, value.cursor);
+    writePosition(chunks, value.cursor);
   }
   if (value.selection === null) {
     chunks.push(new Uint8Array([0]));
   } else {
     chunks.push(new Uint8Array([1]));
-    writeU32(chunks, value.selection.anchor);
-    writeU32(chunks, value.selection.head);
+    writePosition(chunks, value.selection.anchor);
+    writePosition(chunks, value.selection.head);
   }
 }
 
@@ -122,11 +135,18 @@ export class Reader {
     return textDecoder.decode(bytes);
   }
 
+  position(): Uint8Array {
+    const length = this.u16();
+    if (length > MAX_POSITION_BYTES) throw new ProtocolDecodeError(`position too long: ${length} bytes`);
+    // Copied: the frame's buffer is reused by the transport.
+    return this.bytes(length).slice();
+  }
+
   presenceValue(): PresenceValue {
     const displayName = this.string();
     const color = this.string();
-    const cursor = this.bool() ? this.u32() : null;
-    const selection = this.bool() ? { anchor: this.u32(), head: this.u32() } : null;
+    const cursor = this.bool() ? this.position() : null;
+    const selection = this.bool() ? { anchor: this.position(), head: this.position() } : null;
     return { displayName, color, cursor, selection };
   }
 
@@ -156,7 +176,15 @@ export type DecodedMessage =
       /** Null when absent, and also when the version didn't match. */
       resumeToken: Uint8Array | null;
     }
-  | { type: typeof MessageType.Welcome; clientId: string; resumed: boolean }
+  | {
+      type: typeof MessageType.Welcome;
+      clientId: string;
+      resumed: boolean;
+      /** How often the server pings this connection. The client derives its
+       * own liveness timeout from it, so a silent connection is recognised as
+       * useless without waiting for the socket to notice. */
+      heartbeatIntervalMs: number;
+    }
   | { type: typeof MessageType.Ping }
   | { type: typeof MessageType.Pong }
   | { type: typeof MessageType.ResumeToken; token: Uint8Array }
@@ -188,10 +216,11 @@ export function encodeHello(
   return concat(chunks);
 }
 
-export function encodeWelcome(clientId: string, resumed = false): Uint8Array {
+export function encodeWelcome(clientId: string, resumed = false, heartbeatIntervalMs = 0): Uint8Array {
   const chunks: Uint8Array[] = [new Uint8Array([MessageType.Welcome])];
   writeString(chunks, clientId);
   chunks.push(new Uint8Array([resumed ? 1 : 0]));
+  writeU32(chunks, heartbeatIntervalMs);
   return concat(chunks);
 }
 
@@ -262,7 +291,8 @@ export function decode(bytes: Uint8Array): DecodedMessage {
     case MessageType.Welcome: {
       const clientId = reader.string();
       const resumed = reader.bool();
-      return { type: MessageType.Welcome, clientId, resumed };
+      const heartbeatIntervalMs = reader.u32();
+      return { type: MessageType.Welcome, clientId, resumed, heartbeatIntervalMs };
     }
     case MessageType.Ping:
       return { type: MessageType.Ping };

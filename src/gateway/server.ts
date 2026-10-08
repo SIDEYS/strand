@@ -228,7 +228,7 @@ export class GatewayServer {
     const room = this.#rooms.join(roomId, connection);
     if (resumed) void this.#fanout?.restorePresence(room, clientId);
 
-    connection.send(encodeWelcome(clientId, resumed));
+    connection.send(encodeWelcome(clientId, resumed, this.#config.heartbeatIntervalMs));
     this.#sendResumeToken(connection);
 
     // A newly-joined client needs to know who's already here before it has

@@ -6,7 +6,7 @@ import { connectRedis } from './bus.js';
 import { PresenceStore } from './presenceStore.js';
 import { startTestRedis, type TestRedis } from './testRedis.js';
 
-const value: PresenceValue = { displayName: 'Ada', color: '#f0f', cursor: 4, selection: null };
+const value: PresenceValue = { displayName: 'Ada', color: '#f0f', cursor: new Uint8Array([4]), selection: null };
 const TTL_MS = 600;
 
 async function waitUntil(predicate: () => Promise<boolean>, timeoutMs: number): Promise<number> {
@@ -53,10 +53,10 @@ describe('PresenceStore (real Redis)', () => {
 
   it('keeps only the latest write for a client', async () => {
     await store.upsert('room-1', { clientId: 'a', timestamp: 10, value });
-    await store.upsert('room-1', { clientId: 'a', timestamp: 20, value: { ...value, cursor: 9 } });
+    await store.upsert('room-1', { clientId: 'a', timestamp: 20, value: { ...value, cursor: new Uint8Array([9]) } });
     const entries = await store.list('room-1');
     expect(entries).toHaveLength(1);
-    expect(entries[0]).toMatchObject({ timestamp: 20, value: { cursor: 9 } });
+    expect(entries[0]).toMatchObject({ timestamp: 20, value: { cursor: new Uint8Array([9]) } });
   });
 
   it('expires an entry that is never refreshed', async () => {

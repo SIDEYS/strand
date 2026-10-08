@@ -15,7 +15,7 @@ import {
 import { encodeFrameEnvelope } from './envelope.js';
 import { startTestRedis, type TestRedis } from './testRedis.js';
 
-const ada: PresenceValue = { displayName: 'Ada', color: '#f0f', cursor: 3, selection: null };
+const ada: PresenceValue = { displayName: 'Ada', color: '#f0f', cursor: new Uint8Array([3]), selection: null };
 /** With reconciliation effectively off, the only way state can move between
  * instances is the fan-out frames themselves, which is what the tests that
  * inspect fan-out behaviour need to isolate. */

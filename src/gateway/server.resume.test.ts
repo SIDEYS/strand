@@ -6,7 +6,7 @@ import { signResumeToken, verifyResumeToken } from '../session/resumeToken.js';
 import { baseConfig, joinRoom, once, startServer, type Harness } from './testSupport.js';
 
 const config = baseConfig();
-const ada: PresenceValue = { displayName: 'Ada', color: '#f0f', cursor: 3, selection: null };
+const ada: PresenceValue = { displayName: 'Ada', color: '#f0f', cursor: new Uint8Array([3]), selection: null };
 
 let harness: Harness | undefined;
 afterEach(async () => {
@@ -151,7 +151,7 @@ describe('resume handshake (standalone)', () => {
     expect(verdict.ok && verdict.claims.expiresAt).toBeGreaterThan(original.claims.expiresAt);
   });
 
-  it('is still PROTOCOL_VERSION 2 (guards against an accidental bump or revert)', () => {
-    expect(PROTOCOL_VERSION).toBe(2);
+  it('is still PROTOCOL_VERSION 3 (guards against an accidental bump or revert)', () => {
+    expect(PROTOCOL_VERSION).toBe(3);
   });
 });

@@ -45,7 +45,7 @@ describe('GatewayServer', () => {
     const { ws: b, messages: bMessages } = await joinRoom(harness.url, 'room-1');
     const { ws: c, messages: cMessages } = await joinRoom(harness.url, 'room-2');
 
-    const value: PresenceValue = { displayName: 'Ada', color: '#fff', cursor: 5, selection: null };
+    const value: PresenceValue = { displayName: 'Ada', color: '#fff', cursor: new Uint8Array([5]), selection: null };
     a.send(encodePresenceUpdate(value));
 
     const received = await bMessages.next();

@@ -4,8 +4,8 @@ import type { PresenceValue } from '../presence/types.js';
 import { MessageType, encodeHello, encodePresenceUpdate } from '../protocol/index.js';
 import { MessageCollector, baseConfig, joinRoom, once, startServer, type Harness } from './testSupport.js';
 
-const alice: PresenceValue = { displayName: 'Alice', color: '#f00', cursor: 3, selection: null };
-const bob: PresenceValue = { displayName: 'Bob', color: '#0f0', cursor: 7, selection: { anchor: 1, head: 4 } };
+const alice: PresenceValue = { displayName: 'Alice', color: '#f00', cursor: new Uint8Array([3]), selection: null };
+const bob: PresenceValue = { displayName: 'Bob', color: '#0f0', cursor: new Uint8Array([7]), selection: { anchor: new Uint8Array([1]), head: new Uint8Array([4]) } };
 
 let harness: Harness | undefined;
 

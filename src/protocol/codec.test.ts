@@ -67,8 +67,12 @@ describe('protocol codec', () => {
       type: MessageType.Welcome,
       clientId: 'client-abc',
       resumed: false,
+      heartbeatIntervalMs: 0,
     });
-    expect(decode(encodeWelcome('client-abc', true))).toMatchObject({ resumed: true });
+    expect(decode(encodeWelcome('client-abc', true, 15000))).toMatchObject({
+      resumed: true,
+      heartbeatIntervalMs: 15000,
+    });
   });
 
   it('round-trips RESUME_TOKEN', () => {
@@ -139,8 +143,8 @@ describe('protocol codec: presence', () => {
   const full: PresenceValue = {
     displayName: 'Ada',
     color: '#ff00ff',
-    cursor: 42,
-    selection: { anchor: 10, head: 20 },
+    cursor: new Uint8Array([42, 1, 2]),
+    selection: { anchor: new Uint8Array([10, 3]), head: new Uint8Array([20, 4, 5]) },
   };
   const empty: PresenceValue = {
     displayName: 'Ada',
@@ -168,6 +172,20 @@ describe('protocol codec: presence', () => {
       timestamp,
       value: full,
     });
+  });
+
+  it('refuses to encode a position larger than any real relative position', () => {
+    const huge: PresenceValue = { ...full, cursor: new Uint8Array(257) };
+    expect(() => encodePresenceUpdate(huge)).toThrow(ProtocolDecodeError);
+  });
+
+  it('refuses to believe a hostile position length when decoding', () => {
+    const bytes = encodePresenceUpdate({ displayName: 'a', color: 'b', cursor: new Uint8Array([1]), selection: null });
+    // Layout ends: [hasCursor=1][len u16][1 byte][hasSelection=0]; bump len to 0xffff.
+    const lenAt = bytes.length - 1 - 1 - 2;
+    bytes[lenAt] = 0xff;
+    bytes[lenAt + 1] = 0xff;
+    expect(() => decode(bytes)).toThrow(ProtocolDecodeError);
   });
 
   it('round-trips PRESENCE_REMOVE', () => {

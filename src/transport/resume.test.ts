@@ -13,7 +13,7 @@ import {
 } from './clusterSupport.js';
 import { startTestRedis, type TestRedis } from './testRedis.js';
 
-const ada: PresenceValue = { displayName: 'Ada', color: '#f0f', cursor: 3, selection: null };
+const ada: PresenceValue = { displayName: 'Ada', color: '#f0f', cursor: new Uint8Array([3]), selection: null };
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let redis: TestRedis;

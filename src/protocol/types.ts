@@ -14,9 +14,11 @@
 
 /** v2: HELLO carries an optional resume token, WELCOME says whether the
  * session was resumed, and the server may now send SyncStep1 to a client.
- * A v1 client is turned away with CloseCode.ProtocolVersionMismatch before
- * any of that is parsed. */
-export const PROTOCOL_VERSION = 2;
+ * v3: presence positions are encoded Yjs relative positions instead of
+ * integer offsets, and WELCOME carries the server's heartbeat interval.
+ * A client on an older version is turned away with
+ * CloseCode.ProtocolVersionMismatch before any of that is parsed. */
+export const PROTOCOL_VERSION = 3;
 
 /** Hard cap on a single inbound frame's payload. Mirrors the outbound
  * backpressure threshold in the gateway: an unbounded inbound path is the
