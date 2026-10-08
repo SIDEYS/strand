@@ -15,7 +15,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint .",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "migrate": "node-pg-migrate up --migrations-dir migrations --migrations-table pgmigrations",
+    "migrate:down": "node-pg-migrate down --migrations-dir migrations --migrations-table pgmigrations"
   },
   "dependencies": {
     "fastify": "^5.1.0",
