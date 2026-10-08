@@ -30,6 +30,10 @@ export class Connection implements RoomMember {
    * to 0 whenever a PONG arrives; the gateway's heartbeat loop terminates
    * the connection once this reaches the configured max. */
   missedPongs = 0;
+  /** Set once the gateway has removed this connection from its room, so
+   * the explicit departure in shutdown and the socket's later close event
+   * don't both publish a presence removal. */
+  departed = false;
 
   #socket: WebSocket;
   #backpressureThresholdBytes: number;

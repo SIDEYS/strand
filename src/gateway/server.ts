@@ -6,7 +6,9 @@ import * as Y from 'yjs';
 import type { Config } from '../config.js';
 import type { PresenceValue } from '../presence/types.js';
 import { RoomManager } from '../room/RoomManager.js';
-import type { Room } from '../room/Room.js';
+import { REMOTE_ORIGIN, type Room } from '../room/Room.js';
+import { HybridClock } from '../transport/clock.js';
+import type { Replicator } from '../transport/replicator.js';
 import { Connection } from './connection.js';
 import {
   CloseCode,
@@ -27,6 +29,9 @@ export interface GatewayServerOptions {
   server: HttpServer;
   config: Config;
   logger: Logger;
+  /** Cross-instance replication. Omit to run as a standalone instance. */
+  fanout?: Replicator;
+  clock?: HybridClock;
 }
 
 /**
@@ -37,15 +42,27 @@ export interface GatewayServerOptions {
  */
 export class GatewayServer {
   #wss: WebSocketServer;
-  #rooms = new RoomManager();
+  #rooms: RoomManager;
   #connections = new Set<Connection>();
   #config: Config;
   #logger: Logger;
   #heartbeatTimer: NodeJS.Timeout;
+  #fanout: Replicator | undefined;
+  #clock: HybridClock;
 
   constructor(options: GatewayServerOptions) {
     this.#config = options.config;
     this.#logger = options.logger;
+    this.#fanout = options.fanout;
+    this.#clock = options.clock ?? new HybridClock();
+    this.#rooms = new RoomManager({
+      onRoomCreated: (room) => this.#onRoomCreated(room),
+      onRoomDestroyed: (room) => {
+        void this.#fanout?.detachRoom(room.id);
+      },
+    });
+    this.#fanout?.bind((roomId) => this.#rooms.getRoom(roomId));
+    this.#fanout?.start();
     this.#wss = new WebSocketServer({
       server: options.server,
       path: '/ws',
@@ -148,9 +165,13 @@ export class GatewayServer {
     // A newly-joined client needs to know who's already here before it has
     // any way to ask — presence for existing members doesn't otherwise
     // reach a client that wasn't connected when those updates went out.
-    for (const entry of room.presence.entries()) {
-      connection.send(encodePresenceBroadcast(entry.elementId, entry.timestamp, entry.value));
-    }
+    // Waits for the room to have caught up with peers so a client joining an
+    // instance that has never hosted this room isn't shown an empty one.
+    void room.ready.then(() => {
+      for (const entry of room.presence.entries()) {
+        connection.send(encodePresenceBroadcast(entry.elementId, entry.timestamp, entry.value));
+      }
+    });
 
     this.#logger.info({ clientId, roomId: decoded.roomId }, 'client joined room');
     return connection;
@@ -164,10 +185,12 @@ export class GatewayServer {
     switch (decoded.type) {
       case MessageType.Pong:
         connection.missedPongs = 0;
+        // The client being alive is exactly what presence liveness tracks.
+        this.#fanout?.refreshPresence(room, connection.clientId);
         return;
 
       case MessageType.SyncStep1:
-        this.#handleSyncStep1(connection, room, decoded.stateVector);
+        void room.ready.then(() => this.#handleSyncStep1(connection, room, decoded.stateVector));
         return;
 
       case MessageType.DocUpdate:
@@ -215,14 +238,36 @@ export class GatewayServer {
   }
 
   #handleDocUpdate(connection: Connection, room: Room, update: Uint8Array): void {
+    // Delivery to other local clients and publication to other instances
+    // both happen in #onDocUpdate, off the doc's own update event, so a
+    // client's edit and an update healed in from a peer take the same path.
     try {
       Y.applyUpdate(room.doc, update, connection.clientId);
     } catch (err) {
       this.#logger.warn({ err, clientId: connection.clientId }, 'invalid Yjs update');
       connection.disconnect(CloseCode.BadMessage, 'invalid document update');
+    }
+  }
+
+  #onRoomCreated(room: Room): void {
+    room.doc.on('update', (update: Uint8Array, origin: unknown) => this.#onDocUpdate(room, update, origin));
+    if (this.#fanout) room.ready = this.#fanout.attachRoom(room);
+  }
+
+  /** The single place a document change leaves this instance. Applied
+   * locally first, then published: clients here see their own edits at
+   * local latency, never waiting on a Redis round trip. Yjs only fires this
+   * for updates that actually changed the doc, so a duplicate delivery does
+   * nothing here, and REMOTE_ORIGIN keeps an update that arrived from a
+   * peer from being published straight back out. */
+  #onDocUpdate(room: Room, update: Uint8Array, origin: unknown): void {
+    const frame = encodeDocUpdate(update);
+    if (origin === REMOTE_ORIGIN) {
+      room.broadcast(frame);
       return;
     }
-    this.#rooms.broadcast(room.id, encodeDocUpdate(update), connection.clientId);
+    room.broadcast(frame, typeof origin === 'string' ? origin : undefined);
+    this.#fanout?.publishDocUpdate(room.id, update);
   }
 
   #handlePresenceUpdate(connection: Connection, room: Room, value: PresenceValue): void {
@@ -230,18 +275,22 @@ export class GatewayServer {
     // LWW's correctness depends entirely on comparable timestamps; a
     // client with a fast clock could otherwise write an update no other
     // client could ever beat. See docs/adr/0001-presence-lww-set.md.
-    const timestamp = Date.now();
+    const timestamp = this.#clock.now();
     room.presence.add(connection.clientId, value, timestamp, connection.clientId);
-    this.#rooms.broadcast(room.id, encodePresenceBroadcast(connection.clientId, timestamp, value), connection.clientId);
+    room.broadcast(encodePresenceBroadcast(connection.clientId, timestamp, value), connection.clientId);
+    this.#fanout?.publishPresence(room.id, connection.clientId, timestamp, value);
   }
 
   #handleDeparture(connection: Connection): void {
-    if (!connection.roomId) return;
+    if (connection.departed || !connection.roomId) return;
+    connection.departed = true;
+    this.#connections.delete(connection);
     const room = this.#rooms.getRoom(connection.roomId);
-    if (room) {
-      const timestamp = Date.now();
+    if (room?.presence.has(connection.clientId)) {
+      const timestamp = this.#clock.now();
       room.presence.remove(connection.clientId, timestamp, connection.clientId);
-      this.#rooms.broadcast(room.id, encodePresenceRemove(connection.clientId, timestamp), connection.clientId);
+      room.broadcast(encodePresenceRemove(connection.clientId, timestamp), connection.clientId);
+      this.#fanout?.publishPresenceRemove(room.id, connection.clientId, timestamp);
     }
     this.#rooms.leave(connection.roomId, connection.clientId);
   }
@@ -264,11 +313,17 @@ export class GatewayServer {
    * heartbeat loop and the WebSocket server itself. */
   async shutdown(): Promise<void> {
     clearInterval(this.#heartbeatTimer);
-    for (const connection of this.#connections) {
+    for (const connection of [...this.#connections]) {
+      // Depart explicitly rather than waiting for each socket's close
+      // event: those can land after the fan-out connection is gone, which
+      // would leave this instance's clients to linger as ghosts until their
+      // presence TTL expired.
+      this.#handleDeparture(connection);
       connection.disconnect(CloseCode.ServerGoingAway, 'server going away');
     }
     await new Promise<void>((resolve, reject) => {
       this.#wss.close((err) => (err ? reject(err) : resolve()));
     });
+    await this.#fanout?.close();
   }
 }
