@@ -41,6 +41,10 @@ export interface ClientSnapshot {
   status: DisplayStatus;
   clientId: string;
   resumed: boolean;
+  /** True once this connection has applied the server's reply to our state
+   * vector, i.e. the document on screen reflects the room. False between
+   * connecting and that, and again after any reconnect. */
+  synced: boolean;
   peers: readonly Peer[];
   /** Local edits that have not yet been handed to a server: made while
    * disconnected, and cleared once the resync after reconnecting has sent
@@ -104,6 +108,7 @@ export class CollabClient {
   #token: Uint8Array | null;
   #clientId = '';
   #resumed = false;
+  #synced = false;
   #heartbeatIntervalMs = 0;
   #lastHeardAt = 0;
   #presence = new LwwSet<PresenceValue>();
@@ -288,6 +293,7 @@ export class CollabClient {
         this.#clientId = message.clientId;
         this.#resumed = message.resumed;
         this.#heartbeatIntervalMs = message.heartbeatIntervalMs;
+        this.#synced = false;
         this.stats.resumedFlags.push(message.resumed);
         this.#clearHandshakeTimer();
         // The server's snapshot of who is here follows the welcome and says
@@ -305,6 +311,10 @@ export class CollabClient {
         break;
 
       case MessageType.SyncStep2:
+        Y.applyUpdate(this.doc, message.update, this);
+        this.#synced = true;
+        break;
+
       case MessageType.DocUpdate:
         Y.applyUpdate(this.doc, message.update, this);
         break;
@@ -426,6 +436,7 @@ export class CollabClient {
       status: displayStatus(this.#state),
       clientId: this.#clientId,
       resumed: this.#resumed,
+      synced: this.#synced && this.#state.status === 'connected',
       peers: this.#presence
         .entries()
         .filter((entry) => entry.elementId !== this.#clientId)

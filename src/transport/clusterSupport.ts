@@ -2,27 +2,15 @@ import { createServer, type Server } from 'node:http';
 import net from 'node:net';
 import pino from 'pino';
 import { WebSocket } from 'ws';
-import * as Y from 'yjs';
+import type * as Y from 'yjs';
 import type { Config } from '../config.js';
 import { baseConfig } from '../gateway/testSupport.js';
 import { GatewayServer } from '../gateway/server.js';
 import type { PresenceValue } from '../presence/types.js';
-import {
-  MessageType,
-  PROTOCOL_VERSION,
-  decode,
-  encodeDocUpdate,
-  encodeHello,
-  encodePong,
-  encodePresenceUpdate,
-  encodeSyncStep1,
-} from '../protocol/index.js';
-import {
-  step,
-  type ConnectionEvent,
-  type ConnectionState,
-  type ReconnectPolicy,
-} from '../protocol/reconnect.js';
+import { MessageType, decode } from '../protocol/index.js';
+import type { ConnectionState, ReconnectPolicy } from '../protocol/reconnect.js';
+import { CollabClient } from '../client/core.js';
+import type { ClientSocket, Scheduler } from '../client/types.js';
 import { RedisBus, connectRedis, type FanoutBus } from './bus.js';
 import { HybridClock } from './clock.js';
 import { EnvelopeKind, decodeEnvelope } from './envelope.js';
@@ -34,9 +22,6 @@ import type pg from 'pg';
 import { SessionStore } from './sessionStore.js';
 
 const logger = pino({ level: 'silent' });
-
-/** A Yjs update with no structs and an empty delete set is two bytes. */
-const EMPTY_UPDATE_BYTES = 2;
 
 export function mulberry32(seed: number): () => number {
   let a = seed;
@@ -288,243 +273,91 @@ export interface ResilientClientOptions {
   random?: () => number;
   policy?: ReconnectPolicy;
   protocolVersion?: number;
+  resumeToken?: Uint8Array | null;
 }
 
+/** Real time, handed to the core as its scheduler. */
+const systemScheduler: Scheduler = {
+  now: () => Date.now(),
+  setTimeout: (callback, ms) => setTimeout(callback, ms),
+  clearTimeout: (handle) => clearTimeout(handle as NodeJS.Timeout),
+};
+
 /**
- * A client that reconnects on its own, built on the same pure state machine
- * the browser client will use (protocol/reconnect.ts), carrying its resume
- * token across connections. Test-only for now; it exists to prove the whole
- * loop: kill the socket, back off, land on a different instance, resume the
- * identity, and resync only what was missed.
+ * The shipped client core (src/client/core.ts) on Node: `ws` for sockets and
+ * the system clock for time. This is deliberately a thin shell. The
+ * handshake, resume, sync, backoff, and liveness logic it exercises is the
+ * very code the browser runs, not a parallel implementation of it, so a
+ * green integration suite means something about the thing that ships.
  */
 export class ResilientClient {
-  readonly doc: Y.Doc;
-  readonly presence = new Map<string, PresenceValue>();
-  state: ConnectionState = { status: 'idle' };
-  clientId = '';
-  token: Uint8Array | null = null;
-  connectAttempts = 0;
-  /** One entry per completed handshake: was it a resume? */
-  readonly resumedFlags: boolean[] = [];
-  readonly closeCodes: number[] = [];
-  /** Bytes sent / received on the current connection, from HELLO onward. */
-  bytesSent = 0;
-  bytesReceived = 0;
-
-  #options: ResilientClientOptions;
-  #random: () => number;
-  #policy: ReconnectPolicy;
-  #ws: WebSocket | null = null;
-  #timer: NodeJS.Timeout | undefined;
-  #lastPresence: PresenceValue | null = null;
-  #onUpdate: (update: Uint8Array, origin: unknown) => void;
-  #closed = false;
+  readonly core: CollabClient;
+  #lastSocket: WebSocket | null = null;
+  #stoppedByUser = false;
 
   constructor(options: ResilientClientOptions) {
-    this.#options = options;
-    this.doc = options.doc ?? new Y.Doc();
-    this.#random = options.random ?? Math.random;
-    this.#policy = options.policy ?? { baseMs: 10, capMs: 80, immediateJitterMs: 10 };
-    this.#onUpdate = (update, origin) => {
-      if (origin === 'remote' || this.state.status !== 'connected') return;
-      this.#send(encodeDocUpdate(update));
-    };
-    this.doc.on('update', this.#onUpdate);
+    this.core = new CollabClient({
+      roomId: options.roomId,
+      url: options.pickUrl,
+      socketFactory: (url) => {
+        const socket = new WebSocket(url);
+        this.#lastSocket = socket;
+        return socket as unknown as ClientSocket;
+      },
+      scheduler: systemScheduler,
+      random: options.random ?? Math.random,
+      policy: options.policy ?? { baseMs: 10, capMs: 80, immediateJitterMs: 10 },
+      ...(options.doc ? { doc: options.doc } : {}),
+      ...(options.protocolVersion !== undefined ? { protocolVersion: options.protocolVersion } : {}),
+      ...(options.resumeToken ? { resumeToken: options.resumeToken } : {}),
+    });
   }
 
+  get doc(): Y.Doc {
+    return this.core.doc;
+  }
+  get state(): ConnectionState {
+    return this.core.getSnapshot().state;
+  }
+  get clientId(): string {
+    return this.core.getSnapshot().clientId;
+  }
+  get resumed(): boolean {
+    return this.core.getSnapshot().resumed;
+  }
+  get token(): Uint8Array | null {
+    return this.core.token;
+  }
+  get connectAttempts(): number {
+    return this.core.stats.connectAttempts;
+  }
+  get resumedFlags(): readonly boolean[] {
+    return this.core.stats.resumedFlags;
+  }
+  get closeCodes(): readonly number[] {
+    return this.core.stats.closeCodes;
+  }
+  get bytesSent(): number {
+    return this.core.stats.bytesSent;
+  }
+  get bytesReceived(): number {
+    return this.core.stats.bytesReceived;
+  }
+  /** Everyone else's presence, keyed by client ID. */
+  get presence(): Map<string, PresenceValue> {
+    return new Map(this.core.getSnapshot().peers.map((peer) => [peer.clientId, peer.value]));
+  }
+  /** The most recent close code the server (or network) gave, or 1000 if this
+   * client closed itself; null while it has not been closed. */
+  get closeCode(): number | null {
+    return this.core.stats.closeCodes.at(-1) ?? (this.#stoppedByUser ? 1000 : null);
+  }
   get text(): string {
     return this.doc.getText('content').toJSON();
   }
 
   start(): void {
-    this.#dispatch({ type: 'start' });
-  }
-
-  insert(index: number, text: string): void {
-    this.doc.getText('content').insert(index, text);
-  }
-
-  setPresence(value: PresenceValue): void {
-    this.#lastPresence = value;
-    if (this.state.status === 'connected') this.#send(encodePresenceUpdate(value));
-  }
-
-  /** Cuts the transport with no close handshake, like a dropped network. */
-  killSocket(): void {
-    this.#ws?.terminate();
-  }
-
-  manualReconnect(): void {
-    this.#dispatch({ type: 'manual-reconnect' });
-  }
-
-  async connected(timeoutMs = 5000): Promise<void> {
-    await waitUntil(() => this.state.status === 'connected', timeoutMs, 'client to be connected');
-  }
-
-  close(): void {
-    this.#closed = true;
-    clearTimeout(this.#timer);
-    this.doc.off('update', this.#onUpdate);
-    this.#ws?.close();
-  }
-
-  #dispatch(event: ConnectionEvent): void {
-    if (this.#closed) return;
-    const { state, effect } = step(this.state, event, this.#random, this.#policy);
-    this.state = state;
-    switch (effect.kind) {
-      case 'connect':
-        clearTimeout(this.#timer);
-        this.#open();
-        break;
-      case 'schedule-retry':
-        clearTimeout(this.#timer);
-        this.#timer = setTimeout(() => this.#dispatch({ type: 'retry-due' }), effect.delayMs);
-        break;
-      case 'cancel-retry':
-        clearTimeout(this.#timer);
-        break;
-      case 'none':
-        break;
-    }
-  }
-
-  #send(bytes: Uint8Array): void {
-    if (this.#ws?.readyState !== WebSocket.OPEN) return;
-    this.bytesSent += bytes.length;
-    this.#ws.send(bytes);
-  }
-
-  #open(): void {
-    this.connectAttempts += 1;
-    this.bytesSent = 0;
-    this.bytesReceived = 0;
-    const ws = new WebSocket(this.#options.pickUrl(this.connectAttempts));
-    this.#ws = ws;
-    ws.once('open', () => {
-      this.#send(
-        encodeHello(this.#options.roomId, this.#options.protocolVersion ?? PROTOCOL_VERSION, this.token ?? undefined),
-      );
-    });
-    ws.on('message', (data) => {
-      if (ws !== this.#ws) return;
-      const bytes = new Uint8Array(data as Buffer);
-      this.bytesReceived += bytes.length;
-      const msg = decode(bytes);
-      switch (msg.type) {
-        case MessageType.Welcome:
-          this.clientId = msg.clientId;
-          this.resumedFlags.push(msg.resumed);
-          this.#dispatch({ type: 'welcome' });
-          this.#send(encodeSyncStep1(Y.encodeStateVector(this.doc)));
-          // Presence is soft state that doesn't always survive a gap, so
-          // announce again on every connect. Cheap, and idempotent.
-          if (this.#lastPresence) this.#send(encodePresenceUpdate(this.#lastPresence));
-          break;
-        case MessageType.ResumeToken:
-          this.token = msg.token;
-          break;
-        case MessageType.SyncStep2:
-        case MessageType.DocUpdate:
-          Y.applyUpdate(this.doc, msg.update, 'remote');
-          break;
-        case MessageType.SyncStep1: {
-          const missing = Y.encodeStateAsUpdate(this.doc, msg.stateVector);
-          if (missing.length > EMPTY_UPDATE_BYTES) this.#send(encodeDocUpdate(missing));
-          break;
-        }
-        case MessageType.Ping:
-          this.#send(encodePong());
-          break;
-        case MessageType.PresenceBroadcast:
-          this.presence.set(msg.clientId, msg.value);
-          break;
-        case MessageType.PresenceRemove:
-          this.presence.delete(msg.clientId);
-          break;
-        default:
-          break;
-      }
-    });
-    ws.on('close', (code) => {
-      if (ws !== this.#ws) return; // a socket we've already replaced
-      this.closeCodes.push(code);
-      this.#dispatch({ type: 'closed', code });
-    });
-    ws.on('error', () => undefined); // surfaced as a close event
-  }
-}
-
-/** Stand-in for the Phase 6 browser client: a Yjs doc wired to the real
- * protocol. Reconnecting with the same `doc` models a client that kept its
- * local state (and any offline edits) across the gap. */
-export class TestClient {
-  readonly ws: WebSocket;
-  readonly doc: Y.Doc;
-  readonly presence = new Map<string, PresenceValue>();
-  clientId = '';
-  resumed = false;
-  /** The latest resume token the server sent. */
-  token: Uint8Array | null = null;
-  /** Set once the socket closes. */
-  closeCode: number | null = null;
-  ready: Promise<void>;
-  #onUpdate: (update: Uint8Array, origin: unknown) => void;
-
-  constructor(url: string, roomId: string, doc: Y.Doc = new Y.Doc(), resumeToken?: Uint8Array) {
-    this.doc = doc;
-    this.ws = new WebSocket(url);
-    this.ws.on('close', (code) => (this.closeCode = code));
-    this.ready = new Promise((resolve) => {
-      this.ws.once('open', () => this.ws.send(encodeHello(roomId, PROTOCOL_VERSION, resumeToken)));
-      this.ws.on('message', (data) => {
-        const msg = decode(new Uint8Array(data as Buffer));
-        switch (msg.type) {
-          case MessageType.Welcome:
-            this.clientId = msg.clientId;
-            this.resumed = msg.resumed;
-            this.ws.send(encodeSyncStep1(Y.encodeStateVector(this.doc)));
-            break;
-          case MessageType.ResumeToken:
-            this.token = msg.token;
-            break;
-          case MessageType.SyncStep2:
-            Y.applyUpdate(this.doc, msg.update, 'remote');
-            resolve();
-            break;
-          case MessageType.SyncStep1: {
-            // The server's state vector: send back only what it lacks.
-            const missing = Y.encodeStateAsUpdate(this.doc, msg.stateVector);
-            if (missing.length > EMPTY_UPDATE_BYTES) this.ws.send(encodeDocUpdate(missing));
-            break;
-          }
-          case MessageType.DocUpdate:
-            Y.applyUpdate(this.doc, msg.update, 'remote');
-            break;
-          case MessageType.Ping:
-            this.ws.send(encodePong());
-            break;
-          case MessageType.PresenceBroadcast:
-            this.presence.set(msg.clientId, msg.value);
-            break;
-          case MessageType.PresenceRemove:
-            this.presence.delete(msg.clientId);
-            break;
-          default:
-            break;
-        }
-      });
-    });
-    this.#onUpdate = (update, origin) => {
-      if (origin === 'remote' || this.ws.readyState !== WebSocket.OPEN) return;
-      this.ws.send(encodeDocUpdate(update));
-    };
-    this.doc.on('update', this.#onUpdate);
-  }
-
-  get text(): string {
-    return this.doc.getText('content').toJSON();
+    this.core.start();
   }
 
   insert(index: number, text: string): void {
@@ -536,12 +369,53 @@ export class TestClient {
   }
 
   setPresence(value: PresenceValue): void {
-    this.ws.send(encodePresenceUpdate(value));
+    this.core.setPresence(value);
   }
 
-  /** Detaches from the doc so it can be handed to a new connection. */
+  /** Cuts the transport with no close handshake, like a dropped network. */
+  killSocket(): void {
+    this.#lastSocket?.terminate();
+  }
+
+  manualReconnect(): void {
+    this.core.manualReconnect();
+  }
+
+  async connected(timeoutMs = 5000): Promise<void> {
+    await waitUntil(() => this.state.status === 'connected', timeoutMs, 'client to be connected');
+  }
+
   close(): void {
-    this.doc.off('update', this.#onUpdate);
-    this.ws.close();
+    this.#stoppedByUser = true;
+    this.core.stop();
+  }
+}
+
+/**
+ * A client for tests that just want to be a participant in a room: connects
+ * on construction and exposes `ready` for "the initial sync has landed".
+ * Reconnects like any client, so the room it joins sees the real behaviour.
+ */
+export class TestClient extends ResilientClient {
+  readonly ready: Promise<void>;
+
+  constructor(url: string, roomId: string, doc?: Y.Doc, resumeToken?: Uint8Array) {
+    super({
+      roomId,
+      pickUrl: () => url,
+      ...(doc ? { doc } : {}),
+      ...(resumeToken ? { resumeToken } : {}),
+    });
+    this.ready = new Promise<void>((resolve) => {
+      const done = () => this.core.getSnapshot().synced;
+      if (done()) return resolve();
+      const unsubscribe = this.core.subscribe(() => {
+        if (done()) {
+          unsubscribe();
+          resolve();
+        }
+      });
+    });
+    this.start();
   }
 }
