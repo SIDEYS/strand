@@ -5,6 +5,7 @@ import type { PresenceValue } from '../presence/types.js';
 import { MessageType, decode, encodeDocUpdate } from '../protocol/index.js';
 import {
   FAST_TIMINGS,
+  TcpProxy,
   TestClient,
   mulberry32,
   startInstance,
@@ -42,10 +43,12 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  for (const client of clients) client.close();
+  const toClose = clients;
+  const toStop = instances;
   clients = [];
-  for (const instance of instances) await instance.stop();
   instances = [];
+  for (const client of toClose) client.close();
+  for (const instance of toStop) await instance.stop();
 });
 
 async function start(id: string, overrides = {}, random?: () => number): Promise<Instance> {
@@ -226,6 +229,47 @@ describe('cross-instance replication (real Redis)', () => {
     two.bus.dropRate = 0;
     await waitUntil(() => b.text === 'please', 5000, 'deletion to be repaired by the delete-set digest');
   });
+
+  it('keeps serving edits through a real partition from Redis, then converges and restores presence once it heals', async () => {
+    const proxy = await TcpProxy.start(new URL(redis.url).hostname, Number(new URL(redis.url).port));
+    try {
+      const one = await start('one');
+      const two = await startInstance(proxy.url, 'two'); // reaches Redis only through the proxy
+      instances.push(two);
+      const room = nextRoom();
+      const a = await connect(one, room);
+      const b = await connect(two, room);
+
+      b.setPresence(ada);
+      await waitUntil(() => a.presence.size === 1, 5000, 'presence to replicate');
+
+      proxy.sever();
+      a.insert(0, 'left ');
+      b.insert(0, 'right ');
+      // Each side keeps working locally; neither can see the other.
+      await waitUntil(() => a.text === 'left ' && b.text === 'right ', 3000, 'local edits during the partition');
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(a.text).toBe('left ');
+      expect(b.text).toBe('right ');
+
+      // b's presence can no longer be refreshed, so it lapses for everyone
+      // who can still reach Redis.
+      const bound = FAST_TIMINGS.presenceTtlMs! + FAST_TIMINGS.reconcileIntervalMs! * 1.2 + 2000;
+      await waitUntil(() => a.presence.size === 0, bound, 'presence of the partitioned client to lapse');
+
+      proxy.heal();
+      await waitUntil(
+        () => a.text === b.text && a.text.includes('left ') && a.text.includes('right '),
+        15_000,
+        'documents to converge after the partition heals',
+      );
+      // Self-healing in the direction that matters: b's next heartbeat
+      // re-stamps its presence, which beats the removal a synthesised.
+      await waitUntil(() => a.presence.size === 1, 15_000, 'presence to reappear after the partition heals');
+    } finally {
+      await proxy.close();
+    }
+  }, 60_000);
 
   it('converges three instances after heavy random loss and random edits', async () => {
     const SEED = 20261008;
