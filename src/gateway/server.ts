@@ -6,7 +6,8 @@ import * as Y from 'yjs';
 import type { Config } from '../config.js';
 import type { PresenceValue } from '../presence/types.js';
 import { RoomManager } from '../room/RoomManager.js';
-import { REMOTE_ORIGIN, type Room } from '../room/Room.js';
+import type { Persistence } from '../persistence/persistence.js';
+import { PERSISTED_ORIGIN, REMOTE_ORIGIN, type Room } from '../room/Room.js';
 import { signResumeToken, verifyResumeToken } from '../session/resumeToken.js';
 import { HybridClock } from '../transport/clock.js';
 import type { Replicator } from '../transport/replicator.js';
@@ -35,6 +36,8 @@ export interface GatewayServerOptions {
   logger: Logger;
   /** Cross-instance replication. Omit to run as a standalone instance. */
   fanout?: Replicator;
+  /** Write-behind persistence. Omit to keep rooms in memory only. */
+  persistence?: Persistence;
   clock?: HybridClock;
 }
 
@@ -52,17 +55,22 @@ export class GatewayServer {
   #logger: Logger;
   #heartbeatTimer: NodeJS.Timeout;
   #fanout: Replicator | undefined;
+  #persistence: Persistence | undefined;
   #clock: HybridClock;
 
   constructor(options: GatewayServerOptions) {
     this.#config = options.config;
     this.#logger = options.logger;
     this.#fanout = options.fanout;
+    this.#persistence = options.persistence;
     this.#clock = options.clock ?? new HybridClock();
     this.#rooms = new RoomManager({
       onRoomCreated: (room) => this.#onRoomCreated(room),
       onRoomDestroyed: (room) => {
         void this.#fanout?.detachRoom(room.id);
+        // The room's state is about to leave memory: write out anything it
+        // still owes first.
+        void this.#persistence?.detachRoom(room);
       },
     });
     this.#fanout?.bind(
@@ -361,7 +369,12 @@ export class GatewayServer {
 
   #onRoomCreated(room: Room): void {
     room.doc.on('update', (update: Uint8Array, origin: unknown) => this.#onDocUpdate(room, update, origin));
-    if (this.#fanout) room.ready = this.#fanout.attachRoom(room);
+    // Both load in parallel and both are CRDT merges, so neither has to wait
+    // for the other for correctness. Joiners wait for both so they are not
+    // shown a room that is still filling in.
+    const recovered = this.#persistence?.attachRoom(room) ?? Promise.resolve();
+    const replicated = this.#fanout?.attachRoom(room) ?? Promise.resolve();
+    room.ready = Promise.all([recovered, replicated]).then(() => undefined);
   }
 
   /** The single place a document change leaves this instance. Applied
@@ -372,7 +385,10 @@ export class GatewayServer {
    * peer from being published straight back out. */
   #onDocUpdate(room: Room, update: Uint8Array, origin: unknown): void {
     const frame = encodeDocUpdate(update);
-    if (origin === REMOTE_ORIGIN) {
+    // Neither a peer's update nor state read back from Postgres is ours to
+    // publish: the first is already being fanned out by its origin, and the
+    // second is this instance's own database read.
+    if (origin === REMOTE_ORIGIN || origin === PERSISTED_ORIGIN) {
       room.broadcastDocUpdate(frame);
       return;
     }
@@ -447,6 +463,9 @@ export class GatewayServer {
     await new Promise<void>((resolve, reject) => {
       this.#wss.close((err) => (err ? reject(err) : resolve()));
     });
+    // Persist before the fan-out connection goes: a clean stop should leave
+    // nothing unwritten, which is the window a crash cannot close.
+    await this.#persistence?.close();
     await this.#fanout?.close();
   }
 }

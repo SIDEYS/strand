@@ -1,7 +1,10 @@
+import pg from 'pg';
 import pino from 'pino';
 import { loadConfig } from './config.js';
 import { buildApiServer } from './api/server.js';
 import { GatewayServer } from './gateway/server.js';
+import { DocumentStore } from './persistence/documentStore.js';
+import { Persistence } from './persistence/persistence.js';
 import { RedisBus, connectRedis } from './transport/bus.js';
 import { HybridClock } from './transport/clock.js';
 import { PresenceStore } from './transport/presenceStore.js';
@@ -43,10 +46,37 @@ if (config.redisUrl) {
   logger.warn('REDIS_URL not set: running standalone, rooms are not shared with other instances');
 }
 
-const gateway = new GatewayServer({ server: api.server, config, logger, clock, ...(fanout ? { fanout } : {}) });
+let pool: pg.Pool | undefined;
+let persistence: Persistence | undefined;
+if (config.databaseUrl) {
+  pool = new pg.Pool({ connectionString: config.databaseUrl, max: 10 });
+  pool.on('error', (err) => logger.warn({ err }, 'postgres pool error'));
+  persistence = new Persistence({
+    store: new DocumentStore(pool),
+    instanceId: config.instanceId,
+    logger,
+    flushIntervalMs: config.persistFlushIntervalMs,
+    snapshotEveryOps: config.snapshotEveryOps,
+    snapshotIntervalMs: config.snapshotIntervalMs,
+    retentionVersions: config.opRetentionVersions,
+    maxPendingOps: config.maxPendingOps,
+    maxPendingBytes: 8 * 1024 * 1024,
+  });
+} else {
+  logger.warn('DATABASE_URL not set: documents are not persisted and are lost when every instance of a room stops');
+}
+
+const gateway = new GatewayServer({
+  server: api.server,
+  config,
+  logger,
+  clock,
+  ...(fanout ? { fanout } : {}),
+  ...(persistence ? { persistence } : {}),
+});
 
 await api.listen({ host: config.host, port: config.port });
-logger.info({ host: config.host, port: config.port, fanout: fanout !== undefined }, 'strand gateway listening');
+logger.info({ host: config.host, port: config.port, fanout: fanout !== undefined, persistence: persistence !== undefined }, 'strand gateway listening');
 
 let shuttingDown = false;
 async function shutdown(signal: string): Promise<void> {
@@ -55,6 +85,7 @@ async function shutdown(signal: string): Promise<void> {
   logger.info({ signal }, 'shutting down');
   await gateway.shutdown();
   dataRedis?.disconnect();
+  await pool?.end();
   await api.close();
   process.exit(0);
 }

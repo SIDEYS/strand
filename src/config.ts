@@ -26,6 +26,23 @@ export interface Config {
   /** How long a resume token stays valid. Short on purpose: it only has to
    * outlast a reconnect, and it cannot be revoked once issued. */
   resumeTtlMs: number;
+  /** When unset nothing is persisted: rooms live only in memory, as in
+   * earlier phases. */
+  databaseUrl: string | undefined;
+  /** How often buffered ops are written. Bounds the window in which a crash
+   * of the originating instance loses ops from the log. */
+  persistFlushIntervalMs: number;
+  /** Snapshot after this many changes since the last... */
+  snapshotEveryOps: number;
+  /** ...or this long after the first unsnapshotted change. */
+  snapshotIntervalMs: number;
+  /** Compaction keeps ops tagged within this many snapshot versions of the
+   * newest. Larger is safer against slow-to-snapshot instances and costs
+   * a longer log to replay on recovery. */
+  opRetentionVersions: number;
+  /** Cap on one room's unwritten op buffer before it is dropped in favour of
+   * a forced snapshot. */
+  maxPendingOps: number;
   /** How often each instance announces its state per room so peers can
    * notice and repair anything fan-out dropped. This is the upper bound on
    * how long divergence can persist once the network is healthy again. */
@@ -71,6 +88,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     resumeSecret: suppliedSecret ?? randomUUID() + randomUUID(),
     resumeSecretIsEphemeral: suppliedSecret === undefined,
     resumeTtlMs: envInt(env, 'RESUME_TTL_MS', 5 * 60 * 1000),
+    databaseUrl: env.DATABASE_URL || undefined,
+    persistFlushIntervalMs: envInt(env, 'PERSIST_FLUSH_INTERVAL_MS', 250),
+    snapshotEveryOps: envInt(env, 'SNAPSHOT_EVERY_OPS', 500),
+    snapshotIntervalMs: envInt(env, 'SNAPSHOT_INTERVAL_MS', 30_000),
+    opRetentionVersions: envInt(env, 'OP_RETENTION_VERSIONS', 4),
+    maxPendingOps: envInt(env, 'MAX_PENDING_OPS', 2000),
     reconcileIntervalMs: envInt(env, 'RECONCILE_INTERVAL_MS', 5000),
     joinSyncTimeoutMs: envInt(env, 'JOIN_SYNC_TIMEOUT_MS', 500),
     presenceTtlMs: envInt(env, 'PRESENCE_TTL_MS', 45_000),

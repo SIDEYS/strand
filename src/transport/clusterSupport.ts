@@ -28,6 +28,9 @@ import { HybridClock } from './clock.js';
 import { EnvelopeKind, decodeEnvelope } from './envelope.js';
 import { PresenceStore } from './presenceStore.js';
 import { Replicator } from './replicator.js';
+import { DocumentStore } from '../persistence/documentStore.js';
+import { Persistence, type PersistenceOptions } from '../persistence/persistence.js';
+import type pg from 'pg';
 import { SessionStore } from './sessionStore.js';
 
 const logger = pino({ level: 'silent' });
@@ -176,6 +179,8 @@ export interface Instance {
   bus: LossyBus;
   replicator: Replicator;
   gateway: GatewayServer;
+  /** Present when the instance was started with a Postgres pool. */
+  persistence: Persistence | undefined;
   /** Graceful stop, as on SIGTERM. */
   stop(): Promise<void>;
   /** Process death: nothing reaches Redis on the way out. */
@@ -190,11 +195,19 @@ export const FAST_TIMINGS: Partial<Config> = {
   heartbeatMaxMissedPongs: 5,
 };
 
+export interface InstancePersistence {
+  pool: pg.Pool;
+  overrides?: Partial<PersistenceOptions>;
+  /** Wraps the store, e.g. to stall writes. */
+  wrapStore?: (store: DocumentStore) => DocumentStore;
+}
+
 export async function startInstance(
   redisUrl: string,
   id: string,
   overrides: Partial<Config> = {},
   random?: () => number,
+  persistenceSetup?: InstancePersistence,
 ): Promise<Instance> {
   const config = baseConfig({ ...FAST_TIMINGS, instanceId: id, redisUrl, ...overrides });
   const pub = await connectRedis(redisUrl, { failFast: true, logger });
@@ -212,8 +225,31 @@ export async function startInstance(
     joinSyncTimeoutMs: config.joinSyncTimeoutMs,
     ...(random ? { random } : {}),
   });
+  let persistence: Persistence | undefined;
+  if (persistenceSetup) {
+    const baseStore = new DocumentStore(persistenceSetup.pool);
+    persistence = new Persistence({
+      store: persistenceSetup.wrapStore ? persistenceSetup.wrapStore(baseStore) : baseStore,
+      instanceId: id,
+      logger,
+      flushIntervalMs: config.persistFlushIntervalMs,
+      snapshotEveryOps: config.snapshotEveryOps,
+      snapshotIntervalMs: config.snapshotIntervalMs,
+      retentionVersions: config.opRetentionVersions,
+      maxPendingOps: config.maxPendingOps,
+      maxPendingBytes: 8 * 1024 * 1024,
+      ...(random ? { random } : {}),
+      ...persistenceSetup.overrides,
+    });
+  }
   const httpServer: Server = createServer();
-  const gateway = new GatewayServer({ server: httpServer, config, logger, fanout: replicator });
+  const gateway = new GatewayServer({
+    server: httpServer,
+    config,
+    logger,
+    fanout: replicator,
+    ...(persistence ? { persistence } : {}),
+  });
   await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
   const address = httpServer.address();
   if (address === null || typeof address === 'string') throw new Error('expected AddressInfo');
@@ -225,6 +261,7 @@ export async function startInstance(
     bus,
     replicator,
     gateway,
+    persistence,
     async stop() {
       await gateway.shutdown();
       data.disconnect();
@@ -234,6 +271,7 @@ export async function startInstance(
       // Cut Redis first so the shutdown below cannot deliver the goodbyes
       // (presence removals) a dead process never would.
       replicator.crash();
+      persistence?.crash();
       data.disconnect();
       await gateway.shutdown();
       await closeHttp();

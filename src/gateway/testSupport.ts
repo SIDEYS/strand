@@ -3,7 +3,7 @@ import pino from 'pino';
 import { WebSocket } from 'ws';
 import type { Config } from '../config.js';
 import { MessageType, PROTOCOL_VERSION, decode, encodeHello, type DecodedMessage } from '../protocol/index.js';
-import { GatewayServer } from './server.js';
+import { GatewayServer, type GatewayServerOptions } from './server.js';
 
 export const testLogger = pino({ level: 'silent' });
 
@@ -13,6 +13,12 @@ export function baseConfig(overrides: Partial<Config> = {}): Config {
     port: 0,
     instanceId: 'test-instance',
     redisUrl: undefined,
+    databaseUrl: undefined,
+    persistFlushIntervalMs: 20,
+    snapshotEveryOps: 500,
+    snapshotIntervalMs: 30_000,
+    opRetentionVersions: 4,
+    maxPendingOps: 2000,
     resumeSecret: 'test-resume-secret-at-least-thirty-two-chars',
     resumeSecretIsEphemeral: false,
     resumeTtlMs: 60_000,
@@ -35,9 +41,12 @@ export interface Harness {
   close(): Promise<void>;
 }
 
-export async function startServer(config: Config): Promise<Harness> {
+export async function startServer(
+  config: Config,
+  extra: Partial<Pick<GatewayServerOptions, 'persistence'>> = {},
+): Promise<Harness> {
   const httpServer = createServer();
-  const gateway = new GatewayServer({ server: httpServer, config, logger: testLogger });
+  const gateway = new GatewayServer({ server: httpServer, config, logger: testLogger, ...extra });
   await new Promise<void>((resolve) => httpServer.listen(0, '127.0.0.1', resolve));
   const address = httpServer.address();
   if (address === null || typeof address === 'string') throw new Error('expected AddressInfo');
