@@ -1,0 +1,14 @@
+node_modules
+dist
+web/dist
+coverage
+.git
+.github
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+loadtest/results
+docs
+README.md
