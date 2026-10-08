@@ -35,6 +35,10 @@ export class Connection implements RoomMember {
    * the explicit departure in shutdown and the socket's later close event
    * don't both publish a presence removal. */
   departed = false;
+  /** Document updates are withheld until the client's SyncStep1 has been
+   * answered; see Room.broadcastDocUpdate. A client therefore has to send
+   * SyncStep1 to receive document updates at all. */
+  awaitingSync = true;
   /** Set when a newer connection took over this client ID. A superseded
    * connection is inert: it is closed, its input is ignored, and its
    * departure must not remove presence the client still holds. */

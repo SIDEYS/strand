@@ -39,6 +39,22 @@ export class Room {
     }
   }
 
+  /**
+   * Sends a document update to local members, skipping any that haven't had
+   * their initial sync yet. Such a member is about to be sent the whole
+   * current document as a diff against its own state vector, computed after
+   * this update was applied, so it already covers it. Sending the update too
+   * would deliver the same content twice, and on a cold instance rebuilding
+   * the room from a peer that is the entire document, to a client that just
+   * reconnected holding nearly all of it.
+   */
+  broadcastDocUpdate(bytes: Uint8Array, excludeClientId?: string): void {
+    for (const member of this.members.values()) {
+      if (member.clientId === excludeClientId || member.awaitingSync === true) continue;
+      member.send(bytes);
+    }
+  }
+
   /** Applies a presence add that originated elsewhere. Returns true if
    * what a viewer would see changed (membership or value) — a bare
    * timestamp bump from a heartbeat refresh is not worth re-broadcasting. */

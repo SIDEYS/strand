@@ -8,6 +8,8 @@ import { Room } from './Room.js';
 export interface RoomMember {
   readonly clientId: string;
   send(bytes: Uint8Array): void;
+  /** True until the member's initial document sync has been served. */
+  readonly awaitingSync?: boolean;
 }
 
 export interface RoomLifecycleHooks {

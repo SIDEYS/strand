@@ -78,6 +78,13 @@ export class MessageCollector {
     });
   }
 
+  /** Messages received but not yet taken. Unlike racing next() against a
+   * timeout, this can't leave a pending waiter behind to swallow a later
+   * message, so it is the right way to assert that nothing has arrived. */
+  queued(): readonly DecodedMessage[] {
+    return this.#queue;
+  }
+
   async next(): Promise<DecodedMessage> {
     const queued = this.#queue.shift();
     if (queued) return queued;

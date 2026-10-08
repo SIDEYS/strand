@@ -125,6 +125,36 @@ describe('GatewayServer Yjs document sync', () => {
     ws.close();
   });
 
+  it('withholds document updates from a member until its initial sync, which already covers them', async () => {
+    harness = await startServer(baseConfig());
+    const author = new TestClient(harness.url, 'room-gate');
+    await author.ready;
+
+    // A newcomer that has joined but not yet asked to sync.
+    const { ws, messages } = await joinRoom(harness.url, 'room-gate');
+    author.doc.getText('content').insert(0, 'typed before the newcomer synced');
+    // Bounded observation window for a negative.
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(messages.queued(), 'no DOC_UPDATE before the newcomer has synced').toHaveLength(0);
+
+    // Its sync then delivers that content exactly once, as SYNC_STEP2.
+    ws.send(encodeSyncStep1(Y.encodeStateVector(new Y.Doc())));
+    const step2 = await messages.next();
+    expect(step2.type).toBe(MessageType.SyncStep2);
+    if (step2.type !== MessageType.SyncStep2) throw new Error('unreachable');
+    const local = new Y.Doc();
+    Y.applyUpdate(local, step2.update, 'remote');
+    expect(local.getText('content').toJSON()).toBe('typed before the newcomer synced');
+
+    // And once synced it receives later updates normally.
+    await messages.next(); // the server's SyncStep1
+    author.doc.getText('content').insert(0, '!');
+    expect((await messages.next()).type).toBe(MessageType.DocUpdate);
+
+    author.close();
+    ws.close();
+  });
+
   it('two clients converge to identical document state after concurrent edits', async () => {
     harness = await startServer(baseConfig());
     const a = new TestClient(harness.url, 'room-concurrent');

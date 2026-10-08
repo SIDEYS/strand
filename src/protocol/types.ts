@@ -42,7 +42,9 @@ export const MessageType = {
    * Yjs state vector, send me what I'm missing." The server answers with
    * SyncStep2 and then sends its own SyncStep1, so the client can reply
    * with a DocUpdate holding only what the server lacks: reconnect costs
-   * what was missed, not the size of the document. */
+   * what was missed, not the size of the document. The server withholds
+   * DocUpdates from a client until it has answered that client's SyncStep1,
+   * so a client must send one to receive document updates at all. */
   SyncStep1: 0x10,
   /** server -> client, reply to SyncStep1: a Yjs update containing only
    * what the client's state vector didn't already have. */

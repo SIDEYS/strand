@@ -342,6 +342,9 @@ export class GatewayServer {
     // was disconnected) has nothing to diff against and would have to push
     // its whole document. With it, the client sends exactly what's missing.
     connection.send(encodeSyncStep1(Y.encodeStateVector(room.doc)));
+    // From here on, document updates are delivered to this client. This runs
+    // in the same tick as the diff above, so nothing can slip between them.
+    connection.awaitingSync = false;
   }
 
   #handleDocUpdate(connection: Connection, room: Room, update: Uint8Array): void {
@@ -370,10 +373,10 @@ export class GatewayServer {
   #onDocUpdate(room: Room, update: Uint8Array, origin: unknown): void {
     const frame = encodeDocUpdate(update);
     if (origin === REMOTE_ORIGIN) {
-      room.broadcast(frame);
+      room.broadcastDocUpdate(frame);
       return;
     }
-    room.broadcast(frame, typeof origin === 'string' ? origin : undefined);
+    room.broadcastDocUpdate(frame, typeof origin === 'string' ? origin : undefined);
     this.#fanout?.publishDocUpdate(room.id, update);
   }
 
