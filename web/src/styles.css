@@ -1,0 +1,62 @@
+@import 'tailwindcss';
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+/* The page surface is set once, here, so every page (the picker as well as
+   the room) gets a background and text colour that agree with each other.
+   Setting it per page is how one of them ends up light-on-white in dark mode. */
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  background: #f8fafc;
+  color: #0f172a;
+  color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+  body {
+    background: #020617;
+    color: #e2e8f0;
+  }
+}
+
+/* Rendered Markdown. Tailwind's preflight resets element styles, so the
+   preview needs its own typography. */
+.markdown-body {
+  max-width: 46rem;
+  line-height: 1.7;
+}
+.markdown-body h1 { font-size: 2rem; font-weight: 700; margin: 0 0 1rem; letter-spacing: -0.02em; }
+.markdown-body h2 { font-size: 1.4rem; font-weight: 650; margin: 2rem 0 0.75rem; }
+.markdown-body h3 { font-size: 1.15rem; font-weight: 650; margin: 1.5rem 0 0.5rem; }
+.markdown-body p { margin: 0.75rem 0; }
+.markdown-body ul { list-style: disc; padding-left: 1.5rem; margin: 0.75rem 0; }
+.markdown-body ol { list-style: decimal; padding-left: 1.5rem; margin: 0.75rem 0; }
+.markdown-body li { margin: 0.3rem 0; }
+.markdown-body a { color: #4f46e5; text-decoration: underline; }
+.markdown-body code { font-family: ui-monospace, Menlo, monospace; font-size: 0.9em; background: rgb(100 116 139 / 0.15); padding: 0.1em 0.35em; border-radius: 0.25rem; }
+.markdown-body pre { background: rgb(100 116 139 / 0.12); padding: 0.9rem 1rem; border-radius: 0.5rem; overflow-x: auto; }
+.markdown-body pre code { background: none; padding: 0; }
+.markdown-body blockquote { border-left: 4px solid #818cf8; padding: 0.1rem 1rem; margin: 1rem 0; color: #64748b; }
+.markdown-body table { border-collapse: collapse; margin: 1rem 0; width: 100%; }
+.markdown-body th, .markdown-body td { border: 1px solid rgb(100 116 139 / 0.35); padding: 0.45rem 0.75rem; text-align: left; }
+.markdown-body th { background: rgb(100 116 139 / 0.12); }
+.markdown-body img { max-width: 100%; }
+.markdown-body hr { border: 0; border-top: 1px solid rgb(100 116 139 / 0.35); margin: 1.5rem 0; }
+
+/* Editor surface follows the page theme. */
+.cm-editor { background: transparent; }
+.cm-editor.cm-focused { outline: none; }
+@media (prefers-color-scheme: dark) {
+  .cm-editor { color: #e2e8f0; }
+  .cm-gutters { background: transparent !important; color: #64748b !important; border: none !important; }
+  .cm-activeLine { background: rgb(148 163 184 / 0.08) !important; }
+  .cm-cursor { border-left-color: #e2e8f0 !important; }
+}
+@media (prefers-color-scheme: light) {
+  .cm-gutters { background: transparent !important; color: #94a3b8 !important; border: none !important; }
+  .cm-activeLine { background: rgb(100 116 139 / 0.07) !important; }
+}

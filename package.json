@@ -17,7 +17,10 @@
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "migrate": "node-pg-migrate up --migrations-dir migrations --migrations-table pgmigrations",
-    "migrate:down": "node-pg-migrate down --migrations-dir migrations --migrations-table pgmigrations"
+    "migrate:down": "node-pg-migrate down --migrations-dir migrations --migrations-table pgmigrations",
+    "dev:web": "vite --config web/vite.config.ts",
+    "build:web": "vite build --config web/vite.config.ts",
+    "typecheck:web": "tsc -p web/tsconfig.json --noEmit"
   },
   "dependencies": {
     "@codemirror/commands": "^6.11.1",
