@@ -21,6 +21,7 @@ import { HybridClock } from './clock.js';
 import { EnvelopeKind, decodeEnvelope } from './envelope.js';
 import { PresenceStore } from './presenceStore.js';
 import { Replicator } from './replicator.js';
+import { SessionStore } from './sessionStore.js';
 
 const logger = pino({ level: 'silent' });
 
@@ -197,6 +198,7 @@ export async function startInstance(
     instanceId: id,
     bus,
     store: new PresenceStore(data, config.presenceTtlMs),
+    sessions: new SessionStore(data, config.presenceTtlMs),
     clock: new HybridClock(),
     logger,
     reconcileIntervalMs: config.reconcileIntervalMs,

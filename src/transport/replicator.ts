@@ -17,16 +17,32 @@ import {
   DELETE_SET_DIGEST_BYTES,
   EnvelopeKind,
   decodeEnvelope,
+  encodeFenceEnvelope,
   encodeFrameEnvelope,
   encodeReconcileEnvelope,
   type Envelope,
 } from './envelope.js';
 import type { PresenceStore } from './presenceStore.js';
+import { instanceOfOwner, type SessionStore } from './sessionStore.js';
+
+/** Bound on session-lease round trips that sit in the connect path or on a
+ * heartbeat. A slow Redis must not stall a join; we degrade to local-only
+ * identity checks instead (see claimSession). */
+const SESSION_TIMEOUT_MS = 1000;
+
+function withTimeout<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
+}
 
 export interface ReplicatorOptions {
   instanceId: string;
   bus: FanoutBus;
   store: PresenceStore;
+  sessions: SessionStore;
   clock: HybridClock;
   logger: Logger;
   reconcileIntervalMs: number;
@@ -79,6 +95,8 @@ export class Replicator {
   readonly instanceId: string;
   #bus: FanoutBus;
   #store: PresenceStore;
+  #sessions: SessionStore;
+  #onFence: (roomId: string, clientId: string, newOwnerId: string) => void = () => undefined;
   #clock: HybridClock;
   #logger: Logger;
   #reconcileIntervalMs: number;
@@ -96,6 +114,7 @@ export class Replicator {
     this.instanceId = options.instanceId;
     this.#bus = options.bus;
     this.#store = options.store;
+    this.#sessions = options.sessions;
     this.#clock = options.clock;
     this.#logger = options.logger;
     this.#reconcileIntervalMs = options.reconcileIntervalMs;
@@ -103,10 +122,15 @@ export class Replicator {
     this.#random = options.random ?? Math.random;
   }
 
-  /** Gives the replicator a way to find live rooms. Set by the gateway,
-   * which owns the room manager the replicator is hooked into. */
-  bind(getRoom: (roomId: string) => Room | undefined): void {
+  /** Gives the replicator a way to find live rooms and to tell the gateway
+   * a connection has been fenced. Set by the gateway, which owns the room
+   * manager the replicator is hooked into. */
+  bind(
+    getRoom: (roomId: string) => Room | undefined,
+    onFence: (roomId: string, clientId: string, newOwnerId: string) => void,
+  ): void {
     this.#getRoom = getRoom;
+    this.#onFence = onFence;
   }
 
   start(): void {
@@ -173,6 +197,74 @@ export class Replicator {
     this.#track(this.#store.upsert(room.id, { clientId, timestamp, value }), 'presence refresh failed', room.id);
   }
 
+  // ---- session identity ----------------------------------------------------
+
+  /** Registers `ownerId` as the live connection for `clientId`, and if a
+   * live connection on another instance held it, tells that instance to
+   * close it. Never throws: with Redis unreachable the join proceeds, and
+   * uniqueness is enforced only among connections on this instance until the
+   * heartbeat check can run again. Refusing to let people connect because
+   * the coordination layer is down would turn a partial outage into a total
+   * one, which is the wrong trade for a collaboration tool. */
+  async claimSession(roomId: string, clientId: string, ownerId: string): Promise<void> {
+    if (this.#closed) return;
+    try {
+      const displaced = await withTimeout(this.#sessions.claim(roomId, clientId, ownerId), SESSION_TIMEOUT_MS);
+      if (displaced === null || displaced === ownerId) return;
+      const target = instanceOfOwner(displaced);
+      if (target === this.instanceId) return; // the gateway fences local connections itself
+      // Best effort and lossy, like everything on the bus. It is the fast
+      // path only: the displaced connection finds out regardless at its next
+      // heartbeat, when touchSession reports it no longer owns the lease.
+      this.#track(
+        this.#bus.publish(channelFor(roomId), encodeFenceEnvelope(this.instanceId, target, clientId, ownerId)),
+        'fence publish failed',
+        roomId,
+      );
+    } catch (err) {
+      this.#logger.warn({ err, roomId, clientId }, 'session claim failed; identity unique per-instance only');
+    }
+  }
+
+  /** False only if a different live connection now owns this client ID. A
+   * Redis error answers true: an outage must not boot connected users. */
+  async touchSession(roomId: string, clientId: string, ownerId: string): Promise<boolean> {
+    if (this.#closed) return true;
+    try {
+      return await withTimeout(this.#sessions.touch(roomId, clientId, ownerId), SESSION_TIMEOUT_MS);
+    } catch (err) {
+      this.#logger.warn({ err, roomId, clientId }, 'session touch failed; assuming ownership');
+      return true;
+    }
+  }
+
+  releaseSession(roomId: string, clientId: string, ownerId: string): void {
+    if (this.#closed) return;
+    this.#track(this.#sessions.release(roomId, clientId, ownerId), 'session release failed', roomId);
+  }
+
+  /** A resuming client reclaims its old presence if that entry outlived the
+   * connection that created it, which happens when the old connection was
+   * fenced instead of departing cleanly. Re-stamped so it beats any removal
+   * a peer synthesised while the client was gone. */
+  async restorePresence(room: Room, clientId: string): Promise<void> {
+    if (this.#closed) return;
+    try {
+      const mine = (await this.#store.list(room.id)).find((entry) => entry.clientId === clientId);
+      if (!mine) return;
+      this.#clock.observe(mine.timestamp);
+      const timestamp = this.#clock.now();
+      room.presence.add(clientId, mine.value, timestamp, clientId);
+      this.#track(
+        this.#store.upsert(room.id, { clientId, timestamp, value: mine.value }),
+        'presence restore failed',
+        room.id,
+      );
+    } catch (err) {
+      this.#logger.warn({ err, roomId: room.id, clientId }, 'presence restore failed');
+    }
+  }
+
   // ---- inbound -------------------------------------------------------------
 
   #onMessage(roomId: string, bytes: Uint8Array): void {
@@ -187,6 +279,11 @@ export class Replicator {
     // because we are subscribed to the channel we publish on.
     if (env.origin === this.instanceId) return;
     if (env.target !== '' && env.target !== this.instanceId) return;
+
+    if (env.kind === EnvelopeKind.Fence) {
+      this.#onFence(roomId, env.clientId, env.newOwnerId);
+      return;
+    }
 
     const room = this.#getRoom(roomId);
     if (!room) return;

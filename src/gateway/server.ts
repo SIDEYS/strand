@@ -7,8 +7,10 @@ import type { Config } from '../config.js';
 import type { PresenceValue } from '../presence/types.js';
 import { RoomManager } from '../room/RoomManager.js';
 import { REMOTE_ORIGIN, type Room } from '../room/Room.js';
+import { signResumeToken, verifyResumeToken } from '../session/resumeToken.js';
 import { HybridClock } from '../transport/clock.js';
 import type { Replicator } from '../transport/replicator.js';
+import { makeOwnerId } from '../transport/sessionStore.js';
 import { Connection } from './connection.js';
 import {
   CloseCode,
@@ -19,6 +21,7 @@ import {
   encodePing,
   encodePresenceBroadcast,
   encodePresenceRemove,
+  encodeResumeToken,
   encodeSyncStep1,
   encodeSyncStep2,
   encodeDocUpdate,
@@ -62,7 +65,13 @@ export class GatewayServer {
         void this.#fanout?.detachRoom(room.id);
       },
     });
-    this.#fanout?.bind((roomId) => this.#rooms.getRoom(roomId));
+    this.#fanout?.bind(
+      (roomId) => this.#rooms.getRoom(roomId),
+      (roomId, clientId, newOwnerId) => {
+        const holder = this.#rooms.getRoom(roomId)?.members.get(clientId);
+        if (holder instanceof Connection && holder.ownerId !== newOwnerId) this.#supersede(holder);
+      },
+    );
     this.#fanout?.start();
     this.#wss = new WebSocketServer({
       server: options.server,
@@ -87,6 +96,7 @@ export class GatewayServer {
 
   #onConnection(socket: WebSocket): void {
     let connection: Connection | null = null;
+    let handshaking = false;
 
     socket.on('message', (data, isBinary) => {
       if (!isBinary) {
@@ -113,18 +123,30 @@ export class GatewayServer {
         return;
       }
 
-      if (!connection) {
-        connection = this.#handleHandshake(socket, decoded);
+      if (connection) {
+        this.#handleMessage(connection, decoded);
         return;
       }
-
-      this.#handleMessage(connection, decoded);
+      if (handshaking) {
+        // The handshake now awaits Redis, so there is a window where the
+        // client hasn't been welcomed yet. A well-behaved client waits for
+        // WELCOME before sending anything.
+        socket.close(CloseCode.BadMessage, 'message sent before WELCOME');
+        return;
+      }
+      handshaking = true;
+      this.#handleHandshake(socket, decoded, (joined) => {
+        // Assigned synchronously at the moment of joining the room, so a
+        // close arriving right after can never miss the departure.
+        connection = joined;
+      }).catch((err: unknown) => {
+        this.#logger.error({ err }, 'handshake failed');
+        socket.close(1011, 'handshake failed');
+      });
     });
 
     socket.on('close', () => {
-      if (!connection) return;
-      this.#connections.delete(connection);
-      this.#handleDeparture(connection);
+      if (connection) this.#handleDeparture(connection);
     });
 
     socket.on('error', (err) => {
@@ -132,36 +154,74 @@ export class GatewayServer {
     });
   }
 
-  #handleHandshake(socket: WebSocket, decoded: DecodedMessage): Connection | null {
+  async #handleHandshake(
+    socket: WebSocket,
+    decoded: DecodedMessage,
+    assign: (connection: Connection) => void,
+  ): Promise<void> {
     if (decoded.type !== MessageType.Hello) {
       socket.close(CloseCode.BadMessage, 'expected HELLO as first message');
-      return null;
+      return;
     }
     if (decoded.protocolVersion !== PROTOCOL_VERSION || decoded.roomId === null) {
       socket.close(CloseCode.ProtocolVersionMismatch, `server speaks protocol version ${PROTOCOL_VERSION}`);
-      return null;
+      return;
     }
     if (decoded.roomId.length === 0) {
       socket.close(CloseCode.BadMessage, 'roomId must not be empty');
-      return null;
+      return;
+    }
+    const roomId = decoded.roomId;
+
+    // A client ID is never taken from the client's say-so. The only way to
+    // have a specific one is a resume token this deployment signed for this
+    // exact client ID and room, and an expired, forged, or wrong-room token
+    // is not an error: the client just becomes a new user, which is also
+    // what a client whose token lapsed during a long outage should be.
+    let clientId: string = randomUUID();
+    let resumed = false;
+    if (decoded.resumeToken !== null) {
+      const verdict = verifyResumeToken(this.#config.resumeSecret, decoded.resumeToken, roomId, Date.now());
+      if (verdict.ok) {
+        clientId = verdict.claims.clientId;
+        resumed = true;
+      } else {
+        this.#logger.debug({ reason: verdict.reason, roomId }, 'resume token rejected; joining as a new user');
+      }
     }
 
-    // Client ID is always server-issued, never taken from the client. If a
-    // client could assert its own ID, two tabs could claim the same
-    // identity and presence would become incoherent. Phase 4's resume
-    // token is the sanctioned way for a reconnecting client to get its old
-    // ID back.
-    const clientId = randomUUID();
     const connection = new Connection({
       socket,
       clientId,
+      ownerId: makeOwnerId(this.#config.instanceId, randomUUID()),
       backpressureThresholdBytes: this.#config.backpressureThresholdBytes,
       logger: this.#logger,
     });
-    connection.roomId = decoded.roomId;
+    connection.roomId = roomId;
+
+    // A token can be presented more than once (two tabs restored after a
+    // crash, or a replay), and a stateless token cannot tell. Uniqueness is
+    // enforced against live state instead: newest wins, and the older
+    // connection is fenced. Local first, then through the shared lease for
+    // connections on other instances (ADR 0003).
+    if (resumed) this.#fenceLocalDuplicate(roomId, clientId, connection);
+    await this.#fanout?.claimSession(roomId, clientId, connection.ownerId);
+    if (socket.readyState !== socket.OPEN) {
+      // The client gave up while we were waiting on Redis.
+      this.#fanout?.releaseSession(roomId, clientId, connection.ownerId);
+      return;
+    }
+    // Re-checked after the await: another resume of the same ID may have
+    // finished joining while this one waited.
+    if (resumed) this.#fenceLocalDuplicate(roomId, clientId, connection);
+
     this.#connections.add(connection);
-    const room = this.#rooms.join(decoded.roomId, connection);
-    connection.send(encodeWelcome(clientId));
+    assign(connection);
+    const room = this.#rooms.join(roomId, connection);
+    if (resumed) void this.#fanout?.restorePresence(room, clientId);
+
+    connection.send(encodeWelcome(clientId, resumed));
+    this.#sendResumeToken(connection);
 
     // A newly-joined client needs to know who's already here before it has
     // any way to ask — presence for existing members doesn't otherwise
@@ -170,16 +230,49 @@ export class GatewayServer {
     // instance that has never hosted this room isn't shown an empty one.
     void room.ready.then(() => {
       for (const entry of room.presence.entries()) {
+        if (entry.elementId === clientId) continue;
         connection.send(encodePresenceBroadcast(entry.elementId, entry.timestamp, entry.value));
       }
     });
 
-    this.#logger.info({ clientId, roomId: decoded.roomId }, 'client joined room');
-    return connection;
+    this.#logger.info({ clientId, roomId, resumed }, 'client joined room');
+  }
+
+  /** Fences any other local connection holding `clientId`. */
+  #fenceLocalDuplicate(roomId: string, clientId: string, except: Connection): void {
+    const existing = this.#rooms.getRoom(roomId)?.members.get(clientId);
+    if (existing instanceof Connection && existing !== except) this.#supersede(existing);
+  }
+
+  /** Closes a connection that a newer one has replaced. Marked first so that
+   * from this moment it is inert: its input is ignored, and its departure
+   * leaves presence and the room slot alone because the client is still
+   * here, on the connection that replaced it. */
+  #supersede(connection: Connection): void {
+    if (connection.superseded || connection.departed) return;
+    connection.superseded = true;
+    this.#logger.info({ clientId: connection.clientId, roomId: connection.roomId }, 'connection superseded');
+    connection.disconnect(CloseCode.Superseded, 'session resumed by a newer connection');
+  }
+
+  #sendResumeToken(connection: Connection): void {
+    if (connection.roomId === null) return;
+    const now = Date.now();
+    connection.tokenIssuedAt = now;
+    connection.send(
+      encodeResumeToken(
+        signResumeToken(this.#config.resumeSecret, {
+          clientId: connection.clientId,
+          roomId: connection.roomId,
+          issuedAt: now,
+          expiresAt: now + this.#config.resumeTtlMs,
+        }),
+      ),
+    );
   }
 
   #handleMessage(connection: Connection, decoded: DecodedMessage): void {
-    if (!connection.roomId) return;
+    if (connection.superseded || !connection.roomId) return;
     const room = this.#rooms.getRoom(connection.roomId);
     if (!room) return;
 
@@ -188,6 +281,13 @@ export class GatewayServer {
         connection.missedPongs = 0;
         // The client being alive is exactly what presence liveness tracks.
         this.#fanout?.refreshPresence(room, connection.clientId);
+        // This is what actually guarantees a fenced connection stops: the
+        // fence message sent at claim time can be lost, but the lease cannot
+        // lie. Finding another owner here bounds how long two connections
+        // can both act as this client to one heartbeat interval.
+        void this.#fanout?.touchSession(room.id, connection.clientId, connection.ownerId).then((owned) => {
+          if (!owned) this.#supersede(connection);
+        });
         return;
 
       case MessageType.SyncStep1:
@@ -208,6 +308,7 @@ export class GatewayServer {
 
       case MessageType.Welcome:
       case MessageType.Ping:
+      case MessageType.ResumeToken:
       case MessageType.SyncStep2:
       case MessageType.PresenceBroadcast:
       case MessageType.PresenceRemove:
@@ -292,13 +393,21 @@ export class GatewayServer {
     connection.departed = true;
     this.#connections.delete(connection);
     const room = this.#rooms.getRoom(connection.roomId);
-    if (room?.presence.has(connection.clientId)) {
-      const timestamp = this.#clock.now();
-      room.presence.remove(connection.clientId, timestamp, connection.clientId);
-      room.broadcast(encodePresenceRemove(connection.clientId, timestamp), connection.clientId);
-      this.#fanout?.publishPresenceRemove(room.id, connection.clientId, timestamp);
+
+    // If a newer connection holds this client ID the person is still here;
+    // this is just the old connection finally going away. Removing presence
+    // or releasing the lease now would erase the successor's.
+    const replaced = connection.superseded || room?.members.get(connection.clientId) !== connection;
+    if (room && !replaced) {
+      if (room.presence.has(connection.clientId)) {
+        const timestamp = this.#clock.now();
+        room.presence.remove(connection.clientId, timestamp, connection.clientId);
+        room.broadcast(encodePresenceRemove(connection.clientId, timestamp), connection.clientId);
+        this.#fanout?.publishPresenceRemove(room.id, connection.clientId, timestamp);
+      }
+      this.#fanout?.releaseSession(room.id, connection.clientId, connection.ownerId);
     }
-    this.#rooms.leave(connection.roomId, connection.clientId);
+    this.#rooms.leave(connection.roomId, connection.clientId, connection);
   }
 
   #tickHeartbeat(): void {
@@ -310,6 +419,11 @@ export class GatewayServer {
       }
       connection.missedPongs += 1;
       connection.send(encodePing());
+      // A connection that stays up longer than a token lives must still end
+      // up holding a valid one, or its next reconnect would be a new user.
+      if (!connection.superseded && Date.now() - connection.tokenIssuedAt > this.#config.resumeTtlMs / 2) {
+        this.#sendResumeToken(connection);
+      }
     }
   }
 

@@ -56,19 +56,19 @@ function fakeSocket(
 describe('Connection backpressure', () => {
   it('reports backpressured once bufferedAmount exceeds the threshold', () => {
     const socket = fakeSocket(2000);
-    const connection = new Connection({ socket, clientId: 'c1', backpressureThresholdBytes: 1000, logger });
+    const connection = new Connection({ socket, clientId: 'c1', ownerId: 'i/c1', backpressureThresholdBytes: 1000, logger });
     expect(connection.isBackpressured()).toBe(true);
   });
 
   it('does not report backpressured below the threshold', () => {
     const socket = fakeSocket(500);
-    const connection = new Connection({ socket, clientId: 'c1', backpressureThresholdBytes: 1000, logger });
+    const connection = new Connection({ socket, clientId: 'c1', ownerId: 'i/c1', backpressureThresholdBytes: 1000, logger });
     expect(connection.isBackpressured()).toBe(false);
   });
 
   it('disconnects with BackpressureDisconnect instead of sending when backpressured', () => {
     const socket = fakeSocket(2000);
-    const connection = new Connection({ socket, clientId: 'c1', backpressureThresholdBytes: 1000, logger });
+    const connection = new Connection({ socket, clientId: 'c1', ownerId: 'i/c1', backpressureThresholdBytes: 1000, logger });
 
     connection.send(new Uint8Array([1, 2, 3]));
 
@@ -81,7 +81,7 @@ describe('Connection backpressure', () => {
 
   it('sends normally when under the threshold', () => {
     const socket = fakeSocket(0);
-    const connection = new Connection({ socket, clientId: 'c1', backpressureThresholdBytes: 1000, logger });
+    const connection = new Connection({ socket, clientId: 'c1', ownerId: 'i/c1', backpressureThresholdBytes: 1000, logger });
 
     connection.send(new Uint8Array([1, 2, 3]));
 
@@ -93,7 +93,7 @@ describe('Connection backpressure', () => {
     vi.useFakeTimers();
     try {
       const socket = fakeSocket(0, { completesClose: false });
-      const connection = new Connection({ socket, clientId: 'c1', backpressureThresholdBytes: 1000, logger });
+      const connection = new Connection({ socket, clientId: 'c1', ownerId: 'i/c1', backpressureThresholdBytes: 1000, logger });
 
       connection.disconnect(CloseCode.HeartbeatTimeout, 'heartbeat timeout');
       expect(socket.terminated).toBe(false);

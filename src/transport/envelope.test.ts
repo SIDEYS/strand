@@ -6,6 +6,7 @@ import {
   ENVELOPE_VERSION,
   EnvelopeKind,
   decodeEnvelope,
+  encodeFenceEnvelope,
   encodeFrameEnvelope,
   encodeReconcileEnvelope,
 } from './envelope.js';
@@ -30,6 +31,17 @@ describe('envelope', () => {
     expect(decoded).toMatchObject({ origin: 'a', target: 'b', isJoin: true });
     expect(Array.from(decoded.stateVector)).toEqual([5, 6, 7, 8]);
     expect(Array.from(decoded.deleteSetDigest)).toEqual(Array.from(digest));
+  });
+
+  it('round-trips a fence envelope', () => {
+    const decoded = decodeEnvelope(encodeFenceEnvelope('inst-b', 'inst-a', 'client-1', 'inst-b/conn-2'));
+    expect(decoded).toEqual({
+      kind: EnvelopeKind.Fence,
+      origin: 'inst-b',
+      target: 'inst-a',
+      clientId: 'client-1',
+      newOwnerId: 'inst-b/conn-2',
+    });
   });
 
   it('rejects an unknown envelope version instead of misparsing it', () => {

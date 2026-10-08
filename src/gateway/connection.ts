@@ -6,6 +6,7 @@ import { CloseCode } from '../protocol/index.js';
 export interface ConnectionOptions {
   socket: WebSocket;
   clientId: string;
+  ownerId: string;
   backpressureThresholdBytes: number;
   logger: Logger;
 }
@@ -34,6 +35,15 @@ export class Connection implements RoomMember {
    * the explicit departure in shutdown and the socket's later close event
    * don't both publish a presence removal. */
   departed = false;
+  /** Set when a newer connection took over this client ID. A superseded
+   * connection is inert: it is closed, its input is ignored, and its
+   * departure must not remove presence the client still holds. */
+  superseded = false;
+  /** Identifies this connection in the session lease: `${instanceId}/${uuid}`.
+   * Distinct from clientId, which survives across connections. */
+  readonly ownerId: string;
+  /** When the resume token last sent to this client was issued. */
+  tokenIssuedAt = 0;
 
   #socket: WebSocket;
   #backpressureThresholdBytes: number;
@@ -43,6 +53,7 @@ export class Connection implements RoomMember {
   constructor(options: ConnectionOptions) {
     this.#socket = options.socket;
     this.clientId = options.clientId;
+    this.ownerId = options.ownerId;
     this.#backpressureThresholdBytes = options.backpressureThresholdBytes;
     this.#logger = options.logger;
     this.#socket.once('close', () => {

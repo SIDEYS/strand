@@ -22,12 +22,18 @@ export const EnvelopeKind = {
   Frame: 0,
   /** body is a reconciliation request; see ReconcileBody. */
   Reconcile: 1,
+  /** body is [clientId][newOwnerId]: a newer connection has taken over this
+   * client ID, so any connection holding it under a different owner ID must
+   * be closed. Lossy like everything here; the lease check on heartbeat is
+   * what guarantees a fenced connection eventually notices. */
+  Fence: 2,
 } as const;
 
 export const DELETE_SET_DIGEST_BYTES = 16;
 
 export type Envelope =
   | { kind: typeof EnvelopeKind.Frame; origin: string; target: string; frame: Uint8Array }
+  | { kind: typeof EnvelopeKind.Fence; origin: string; target: string; clientId: string; newOwnerId: string }
   | {
       kind: typeof EnvelopeKind.Reconcile;
       origin: string;
@@ -53,6 +59,18 @@ function header(kind: number, origin: string, target: string): Uint8Array[] {
 
 export function encodeFrameEnvelope(origin: string, target: string, frame: Uint8Array): Uint8Array {
   return concat([...header(EnvelopeKind.Frame, origin, target), frame]);
+}
+
+export function encodeFenceEnvelope(
+  origin: string,
+  target: string,
+  clientId: string,
+  newOwnerId: string,
+): Uint8Array {
+  const chunks = header(EnvelopeKind.Fence, origin, target);
+  writeString(chunks, clientId);
+  writeString(chunks, newOwnerId);
+  return concat(chunks);
 }
 
 export function encodeReconcileEnvelope(
@@ -86,6 +104,8 @@ export function decodeEnvelope(bytes: Uint8Array): Envelope {
   switch (kind) {
     case EnvelopeKind.Frame:
       return { kind, origin, target, frame: reader.rest() };
+    case EnvelopeKind.Fence:
+      return { kind, origin, target, clientId: reader.string(), newOwnerId: reader.string() };
     case EnvelopeKind.Reconcile: {
       const isJoin = reader.u8() === 1;
       const stateVector = reader.bytes(reader.u32());

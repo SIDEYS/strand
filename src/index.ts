@@ -6,6 +6,7 @@ import { RedisBus, connectRedis } from './transport/bus.js';
 import { HybridClock } from './transport/clock.js';
 import { PresenceStore } from './transport/presenceStore.js';
 import { Replicator } from './transport/replicator.js';
+import { SessionStore } from './transport/sessionStore.js';
 
 const config = loadConfig();
 const logger = pino({ level: config.logLevel, base: { instanceId: config.instanceId } });
@@ -32,6 +33,7 @@ if (config.redisUrl) {
     instanceId: config.instanceId,
     bus: new RedisBus(pub, sub, logger),
     store: new PresenceStore(dataRedis, config.presenceTtlMs),
+    sessions: new SessionStore(dataRedis, config.presenceTtlMs),
     clock,
     logger,
     reconcileIntervalMs: config.reconcileIntervalMs,

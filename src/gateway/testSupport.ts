@@ -2,7 +2,7 @@ import { createServer, type Server } from 'node:http';
 import pino from 'pino';
 import { WebSocket } from 'ws';
 import type { Config } from '../config.js';
-import { MessageType, decode, encodeHello, type DecodedMessage } from '../protocol/index.js';
+import { MessageType, PROTOCOL_VERSION, decode, encodeHello, type DecodedMessage } from '../protocol/index.js';
 import { GatewayServer } from './server.js';
 
 export const testLogger = pino({ level: 'silent' });
@@ -92,12 +92,25 @@ export function once(ws: WebSocket, event: 'close' | 'open'): Promise<unknown[]>
 export async function joinRoom(
   url: string,
   roomId: string,
-): Promise<{ ws: WebSocket; clientId: string; messages: MessageCollector }> {
+  resumeToken?: Uint8Array,
+): Promise<{
+  ws: WebSocket;
+  clientId: string;
+  resumed: boolean;
+  token: Uint8Array;
+  messages: MessageCollector;
+}> {
   const ws = new WebSocket(url);
   const messages = new MessageCollector(ws);
   await once(ws, 'open');
-  ws.send(encodeHello(roomId));
-  const msg = await messages.next();
-  if (msg.type !== MessageType.Welcome) throw new Error(`expected WELCOME, got type ${msg.type}`);
-  return { ws, clientId: msg.clientId, messages };
+  ws.send(encodeHello(roomId, PROTOCOL_VERSION, resumeToken));
+  const welcome = await messages.next();
+  if (welcome.type !== MessageType.Welcome) throw new Error(`expected WELCOME, got type ${welcome.type}`);
+  // The server follows WELCOME with the token the client would present to
+  // resume this identity; consume it here so tests see the next real message.
+  const tokenMessage = await messages.next();
+  if (tokenMessage.type !== MessageType.ResumeToken) {
+    throw new Error(`expected RESUME_TOKEN, got type ${tokenMessage.type}`);
+  }
+  return { ws, clientId: welcome.clientId, resumed: welcome.resumed, token: tokenMessage.token, messages };
 }

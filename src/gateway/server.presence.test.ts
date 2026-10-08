@@ -50,6 +50,7 @@ describe('GatewayServer presence', () => {
 
     const welcome = await messages.next();
     expect(welcome.type).toBe(MessageType.Welcome);
+    expect((await messages.next()).type).toBe(MessageType.ResumeToken);
 
     const snapshot = await messages.next();
     expect(snapshot).toMatchObject({ type: MessageType.PresenceBroadcast, clientId: aId, value: alice });
