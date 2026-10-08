@@ -10,6 +10,7 @@ import {
   encodePresenceBroadcast,
   encodePresenceRemove,
   encodePresenceUpdate,
+  encodeResumeToken,
   encodeSyncStep1,
   encodeSyncStep2,
   encodeWelcome,
@@ -24,18 +25,57 @@ describe('protocol codec', () => {
       type: MessageType.Hello,
       protocolVersion: PROTOCOL_VERSION,
       roomId: 'room-42',
+      resumeToken: null,
     });
+  });
+
+  it('round-trips a HELLO carrying a resume token', () => {
+    const token = new Uint8Array([9, 8, 7, 6, 5]);
+    const msg = decode(encodeHello('room-42', PROTOCOL_VERSION, token));
+    expect(msg.type).toBe(MessageType.Hello);
+    if (msg.type !== MessageType.Hello) throw new Error('unreachable');
+    expect(Array.from(msg.resumeToken ?? [])).toEqual([9, 8, 7, 6, 5]);
   });
 
   it('stops parsing a HELLO with a mismatched protocol version instead of reading roomId', () => {
     const bytes = encodeHello('room-42', 99);
     const msg = decode(bytes);
-    expect(msg).toEqual({ type: MessageType.Hello, protocolVersion: 99, roomId: null });
+    expect(msg).toEqual({ type: MessageType.Hello, protocolVersion: 99, roomId: null, resumeToken: null });
   });
 
-  it('round-trips WELCOME', () => {
-    const bytes = encodeWelcome('client-abc');
-    expect(decode(bytes)).toEqual({ type: MessageType.Welcome, clientId: 'client-abc' });
+  it('does not attempt to parse a v1 HELLO, whose payload has no token field', () => {
+    // v1 layout: [type][version=1][roomId string], no token length at all.
+    const v1 = new Uint8Array([MessageType.Hello, 1, 0, 2, 0x72, 0x31]);
+    expect(decode(v1)).toEqual({ type: MessageType.Hello, protocolVersion: 1, roomId: null, resumeToken: null });
+  });
+
+  it('rejects a HELLO whose token length prefix overruns the frame', () => {
+    const full = encodeHello('r', PROTOCOL_VERSION, new Uint8Array(10));
+    expect(() => decode(full.subarray(0, full.length - 4))).toThrow(ProtocolDecodeError);
+  });
+
+  it('rejects a HELLO claiming an absurdly long token', () => {
+    const bytes = encodeHello('r');
+    // Overwrite the u16 token length (the last two bytes) with 0xffff.
+    bytes[bytes.length - 2] = 0xff;
+    bytes[bytes.length - 1] = 0xff;
+    expect(() => decode(bytes)).toThrow(ProtocolDecodeError);
+  });
+
+  it('round-trips WELCOME including whether the session was resumed', () => {
+    expect(decode(encodeWelcome('client-abc'))).toEqual({
+      type: MessageType.Welcome,
+      clientId: 'client-abc',
+      resumed: false,
+    });
+    expect(decode(encodeWelcome('client-abc', true))).toMatchObject({ resumed: true });
+  });
+
+  it('round-trips RESUME_TOKEN', () => {
+    const decoded = decode(encodeResumeToken(new Uint8Array([1, 2, 3])));
+    expect(decoded.type).toBe(MessageType.ResumeToken);
+    if (decoded.type !== MessageType.ResumeToken) throw new Error('unreachable');
+    expect(Array.from(decoded.token)).toEqual([1, 2, 3]);
   });
 
   it('round-trips PING and PONG with no payload', () => {

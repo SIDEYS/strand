@@ -12,7 +12,11 @@
  * weight.
  */
 
-export const PROTOCOL_VERSION = 1;
+/** v2: HELLO carries an optional resume token, WELCOME says whether the
+ * session was resumed, and the server may now send SyncStep1 to a client.
+ * A v1 client is turned away with CloseCode.ProtocolVersionMismatch before
+ * any of that is parsed. */
+export const PROTOCOL_VERSION = 2;
 
 /** Hard cap on a single inbound frame's payload. Mirrors the outbound
  * backpressure threshold in the gateway: an unbounded inbound path is the
@@ -29,10 +33,16 @@ export const MessageType = {
   Ping: 0x03,
   /** client -> server: liveness reply. */
   Pong: 0x04,
+  /** server -> client: a signed token the client presents in its next HELLO
+   * to reclaim this identity. Sent after WELCOME and re-sent before it
+   * would expire, so a long-lived connection never holds a stale one. */
+  ResumeToken: 0x05,
 
-  /** client -> server, once per connection right after WELCOME: "here is
-   * my Yjs state vector, send me what I'm missing." Also how a Phase 4
-   * reconnect resyncs after a gap, rather than needing a fresh full doc. */
+  /** Either direction. Client -> server, right after WELCOME: "here is my
+   * Yjs state vector, send me what I'm missing." The server answers with
+   * SyncStep2 and then sends its own SyncStep1, so the client can reply
+   * with a DocUpdate holding only what the server lacks: reconnect costs
+   * what was missed, not the size of the document. */
   SyncStep1: 0x10,
   /** server -> client, reply to SyncStep1: a Yjs update containing only
    * what the client's state vector didn't already have. */
@@ -62,12 +72,16 @@ export type MessageType = (typeof MessageType)[keyof typeof MessageType];
  * Application-level WebSocket close codes, in the private-use range
  * (4000-4999, see RFC 6455 §7.4.2). Defined once, up front, so the client's
  * reconnect logic can branch on *why* the socket closed instead of always
- * guessing. The two buckets that matter to a client:
+ * guessing. Three classes matter to a client (the policy itself lives in
+ * reconnect.ts):
  *
- *   - "reconnect immediately": ServerGoingAway, HeartbeatTimeout
- *   - "reconnect will just fail the same way again, back off / surface an
- *     error instead": ProtocolVersionMismatch, BackpressureDisconnect,
- *     BadMessage, MessageTooLarge
+ *   - retry promptly: ServerGoingAway (another instance is fine)
+ *   - retry with backoff: HeartbeatTimeout, BackpressureDisconnect, and any
+ *     transport failure
+ *   - do not retry: ProtocolVersionMismatch, BadMessage, MessageTooLarge
+ *     (the same request will fail the same way, so retrying is a
+ *     self-inflicted DoS), and Superseded (another connection now owns this
+ *     identity; retrying would just make two tabs evict each other forever)
  */
 export const CloseCode = {
   /** Graceful shutdown (SIGTERM): come back, another instance will take you. */
@@ -82,6 +96,8 @@ export const CloseCode = {
   BadMessage: 4004,
   /** Inbound frame exceeded MAX_INBOUND_MESSAGE_BYTES. */
   MessageTooLarge: 4005,
+  /** A newer connection resumed this client's identity; this one is fenced. */
+  Superseded: 4006,
 } as const;
 
 export type CloseCode = (typeof CloseCode)[keyof typeof CloseCode];

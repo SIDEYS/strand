@@ -28,7 +28,7 @@ export function writeU32(chunks: Uint8Array[], value: number): void {
 /** Timestamps are epoch milliseconds (Date.now()-range), which overflows
  * u32 — encoded as u64 on the wire but kept as `number` everywhere in TS,
  * since epoch-ms values are always well within Number.MAX_SAFE_INTEGER. */
-function writeU64(chunks: Uint8Array[], value: number): void {
+export function writeU64(chunks: Uint8Array[], value: number): void {
   const bytes = new Uint8Array(8);
   new DataView(bytes.buffer).setBigUint64(0, BigInt(value), false);
   chunks.push(bytes);
@@ -87,6 +87,13 @@ export class Reader {
     return v;
   }
 
+  u16(): number {
+    if (this.remaining < 2) throw new ProtocolDecodeError('truncated: expected u16');
+    const v = this.#view.getUint16(this.#offset, false);
+    this.#offset += 2;
+    return v;
+  }
+
   u32(): number {
     if (this.remaining < 4) throw new ProtocolDecodeError('truncated: expected u32');
     const v = this.#view.getUint32(this.#offset, false);
@@ -142,10 +149,17 @@ export type DecodedMessage =
   // version's HELLO payload might not even be laid out as [u16 len][utf8],
   // so we deliberately stop reading right after the version byte instead of
   // guessing at a schema we don't know.
-  | { type: typeof MessageType.Hello; protocolVersion: number; roomId: string | null }
-  | { type: typeof MessageType.Welcome; clientId: string }
+  | {
+      type: typeof MessageType.Hello;
+      protocolVersion: number;
+      roomId: string | null;
+      /** Null when absent, and also when the version didn't match. */
+      resumeToken: Uint8Array | null;
+    }
+  | { type: typeof MessageType.Welcome; clientId: string; resumed: boolean }
   | { type: typeof MessageType.Ping }
   | { type: typeof MessageType.Pong }
+  | { type: typeof MessageType.ResumeToken; token: Uint8Array }
   | { type: typeof MessageType.SyncStep1; stateVector: Uint8Array }
   | { type: typeof MessageType.SyncStep2; update: Uint8Array }
   | { type: typeof MessageType.DocUpdate; update: Uint8Array }
@@ -153,16 +167,36 @@ export type DecodedMessage =
   | { type: typeof MessageType.PresenceBroadcast; clientId: string; timestamp: number; value: PresenceValue }
   | { type: typeof MessageType.PresenceRemove; clientId: string; timestamp: number };
 
-export function encodeHello(roomId: string, protocolVersion = PROTOCOL_VERSION): Uint8Array {
+/** Longest resume token HELLO will carry. Tokens are ~100 bytes; this just
+ * keeps a hostile length prefix from being believed. */
+const MAX_RESUME_TOKEN_BYTES = 512;
+
+export function encodeHello(
+  roomId: string,
+  protocolVersion = PROTOCOL_VERSION,
+  resumeToken?: Uint8Array,
+): Uint8Array {
   const chunks: Uint8Array[] = [new Uint8Array([MessageType.Hello, protocolVersion])];
   writeString(chunks, roomId);
+  const token = resumeToken ?? new Uint8Array();
+  if (token.length > MAX_RESUME_TOKEN_BYTES) {
+    throw new ProtocolDecodeError(`resume token too long: ${token.length} bytes`);
+  }
+  const len = new Uint8Array(2);
+  new DataView(len.buffer).setUint16(0, token.length, false);
+  chunks.push(len, token);
   return concat(chunks);
 }
 
-export function encodeWelcome(clientId: string): Uint8Array {
+export function encodeWelcome(clientId: string, resumed = false): Uint8Array {
   const chunks: Uint8Array[] = [new Uint8Array([MessageType.Welcome])];
   writeString(chunks, clientId);
+  chunks.push(new Uint8Array([resumed ? 1 : 0]));
   return concat(chunks);
+}
+
+export function encodeResumeToken(token: Uint8Array): Uint8Array {
+  return concat([new Uint8Array([MessageType.ResumeToken]), token]);
 }
 
 export function encodePing(): Uint8Array {
@@ -215,19 +249,27 @@ export function decode(bytes: Uint8Array): DecodedMessage {
     case MessageType.Hello: {
       const protocolVersion = reader.u8();
       if (protocolVersion !== PROTOCOL_VERSION) {
-        return { type: MessageType.Hello, protocolVersion, roomId: null };
+        return { type: MessageType.Hello, protocolVersion, roomId: null, resumeToken: null };
       }
       const roomId = reader.string();
-      return { type: MessageType.Hello, protocolVersion, roomId };
+      const tokenLength = reader.u16();
+      if (tokenLength > MAX_RESUME_TOKEN_BYTES) {
+        throw new ProtocolDecodeError(`resume token too long: ${tokenLength} bytes`);
+      }
+      const resumeToken = tokenLength === 0 ? null : reader.bytes(tokenLength);
+      return { type: MessageType.Hello, protocolVersion, roomId, resumeToken };
     }
     case MessageType.Welcome: {
       const clientId = reader.string();
-      return { type: MessageType.Welcome, clientId };
+      const resumed = reader.bool();
+      return { type: MessageType.Welcome, clientId, resumed };
     }
     case MessageType.Ping:
       return { type: MessageType.Ping };
     case MessageType.Pong:
       return { type: MessageType.Pong };
+    case MessageType.ResumeToken:
+      return { type: MessageType.ResumeToken, token: reader.rest() };
     case MessageType.SyncStep1:
       return { type: MessageType.SyncStep1, stateVector: reader.rest() };
     case MessageType.SyncStep2:

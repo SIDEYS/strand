@@ -9,6 +9,7 @@ export {
   decode,
   encodeHello,
   encodeWelcome,
+  encodeResumeToken,
   encodePing,
   encodePong,
   encodeSyncStep1,
