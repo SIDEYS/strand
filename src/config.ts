@@ -27,6 +27,9 @@ export interface Config {
   /** How long a resume token stays valid. Short on purpose: it only has to
    * outlast a reconnect, and it cannot be revoked once issued. */
   resumeTtlMs: number;
+  /** Directory of the built web client, served at /. If it does not exist
+   * the server runs API-only. */
+  webRoot: string;
   /** The room seeded with welcome content. Empty disables seeding. */
   demoRoom: string;
   /** When unset nothing is persisted: rooms live only in memory, as in
@@ -91,6 +94,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     resumeSecret: suppliedSecret ?? randomUUID() + randomUUID(),
     resumeSecretIsEphemeral: suppliedSecret === undefined,
     resumeTtlMs: envInt(env, 'RESUME_TTL_MS', 5 * 60 * 1000),
+    webRoot: env.WEB_ROOT ?? 'web/dist',
     demoRoom: env.DEMO_ROOM ?? DEFAULT_DEMO_ROOM,
     databaseUrl: env.DATABASE_URL || undefined,
     persistFlushIntervalMs: envInt(env, 'PERSIST_FLUSH_INTERVAL_MS', 250),

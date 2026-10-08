@@ -13,6 +13,7 @@ export function baseConfig(overrides: Partial<Config> = {}): Config {
     port: 0,
     instanceId: 'test-instance',
     redisUrl: undefined,
+    webRoot: 'web/dist',
     demoRoom: 'demo',
     databaseUrl: undefined,
     persistFlushIntervalMs: 20,

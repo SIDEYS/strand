@@ -1,3 +1,5 @@
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import pg from 'pg';
 import pino from 'pino';
 import { loadConfig } from './config.js';
@@ -18,7 +20,9 @@ if (config.resumeSecretIsEphemeral) {
   logger.warn('RESUME_SECRET not set: using a throwaway secret, so resume tokens will not survive a restart');
 }
 
-const api = buildApiServer(logger);
+const staticRoot = existsSync(path.join(config.webRoot, 'index.html')) ? path.resolve(config.webRoot) : undefined;
+if (staticRoot === undefined) logger.warn({ webRoot: config.webRoot }, 'no built web client found; serving the API only (run: npm run build:web)');
+const api = buildApiServer(logger, staticRoot ? { staticRoot } : {});
 await api.ready();
 
 const clock = new HybridClock();
