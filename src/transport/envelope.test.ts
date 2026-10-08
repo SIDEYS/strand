@@ -34,14 +34,25 @@ describe('envelope', () => {
   });
 
   it('round-trips a fence envelope', () => {
-    const decoded = decodeEnvelope(encodeFenceEnvelope('inst-b', 'inst-a', 'client-1', 'inst-b/conn-2'));
+    const decoded = decodeEnvelope(encodeFenceEnvelope('inst-b', 'inst-a', 'client-1', 'inst-b/conn-2', 1234));
     expect(decoded).toEqual({
       kind: EnvelopeKind.Fence,
       origin: 'inst-b',
       target: 'inst-a',
+      sentAt: 1234,
       clientId: 'client-1',
       newOwnerId: 'inst-b/conn-2',
     });
+  });
+
+  it('carries the sender\'s wall clock so receivers can histogram fan-out latency', () => {
+    const sentAt = 1_791_500_000_123; // an epoch-ms value, far beyond u32
+    const frame = decodeEnvelope(encodeFrameEnvelope('a', '', new Uint8Array([1]), sentAt));
+    expect(frame.sentAt).toBe(sentAt);
+    const reconcile = decodeEnvelope(
+      encodeReconcileEnvelope('a', '', false, new Uint8Array([1]), new Uint8Array(DELETE_SET_DIGEST_BYTES), sentAt),
+    );
+    expect(reconcile.sentAt).toBe(sentAt);
   });
 
   it('rejects an unknown envelope version instead of misparsing it', () => {
