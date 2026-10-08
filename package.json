@@ -20,6 +20,8 @@
   "dependencies": {
     "fastify": "^5.1.0",
     "ioredis": "^6.0.0",
+    "node-pg-migrate": "^9.0.0",
+    "pg": "^8.23.1",
     "pino": "^9.5.0",
     "ws": "^8.18.0",
     "yjs": "^13.6.33"
@@ -27,6 +29,7 @@
   "devDependencies": {
     "@eslint/js": "^9.15.0",
     "@types/node": "^22.10.0",
+    "@types/pg": "^8.23.1",
     "@types/ws": "^8.5.13",
     "eslint": "^9.15.0",
     "testcontainers": "^12.2.0",
