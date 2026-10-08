@@ -56,9 +56,14 @@ export class RoomManager {
     return room;
   }
 
-  leave(roomId: string, clientId: string): void {
+  /** Removes a member. When `member` is given, only if that exact
+   * connection is still the registered one for the ID: after a resume the
+   * newer connection holds the slot, and the older one's late departure
+   * must not evict it. */
+  leave(roomId: string, clientId: string, member?: RoomMember): void {
     const room = this.#rooms.get(roomId);
     if (!room) return;
+    if (member !== undefined && room.members.get(clientId) !== member) return;
     room.members.delete(clientId);
     if (room.members.size === 0) {
       this.#rooms.delete(roomId);
