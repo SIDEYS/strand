@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import * as Y from 'yjs';
 import { MessageType, decode, encodeDocUpdate, encodeHello, encodeSyncStep1 } from '../protocol/index.js';
+import { DEMO_MARKDOWN } from '../demo/seed.js';
 import { baseConfig, joinRoom, startServer, type Harness } from './testSupport.js';
 
 /** A minimal stand-in for the real Phase 6 client: a Yjs doc wired to a
@@ -153,6 +154,17 @@ describe('GatewayServer Yjs document sync', () => {
 
     author.close();
     ws.close();
+  });
+
+  it('serves the demo room pre-filled, and other rooms empty', async () => {
+    harness = await startServer(baseConfig());
+    const demo = new TestClient(harness.url, 'demo');
+    const other = new TestClient(harness.url, 'not-the-demo');
+    await Promise.all([demo.ready, other.ready]);
+    expect(demo.text()).toBe(DEMO_MARKDOWN);
+    expect(other.text()).toBe('');
+    demo.close();
+    other.close();
   });
 
   it('two clients converge to identical document state after concurrent edits', async () => {

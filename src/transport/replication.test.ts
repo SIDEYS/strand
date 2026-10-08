@@ -13,6 +13,7 @@ import {
   type Instance,
 } from './clusterSupport.js';
 import { encodeFrameEnvelope } from './envelope.js';
+import { DEMO_MARKDOWN } from '../demo/seed.js';
 import { startTestRedis, type TestRedis } from './testRedis.js';
 
 const ada: PresenceValue = { displayName: 'Ada', color: '#f0f', cursor: new Uint8Array([3]), selection: null };
@@ -78,6 +79,22 @@ describe('cross-instance replication (real Redis)', () => {
     await waitUntil(() => a.text === b.text && a.text.length === 28, 5000, 'A and B to converge');
     expect(a.text).toContain('Hello from A. ');
     expect(a.text).toContain('Hello from B. ');
+  });
+
+  it('seeds the demo room identically on every instance, so instances never duplicate it', async () => {
+    const [one, two] = [await start('one'), await start('two')];
+    // Each instance creates the room and seeds it independently, before it
+    // has heard from the other.
+    const a = await connect(one, 'demo');
+    const b = await connect(two, 'demo');
+    expect(a.text).toBe(DEMO_MARKDOWN);
+    expect(b.text).toBe(DEMO_MARKDOWN);
+
+    // Let reconciliation run between them, then edit on one side.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    a.insert(0, '>> ');
+    await waitUntil(() => b.text === '>> ' + DEMO_MARKDOWN, 5000, 'edit to replicate');
+    expect(a.text).toBe('>> ' + DEMO_MARKDOWN);
   });
 
   it('does not re-publish an update that arrived from a peer (one edit, one publish, across three instances)', async () => {

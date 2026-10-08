@@ -6,6 +6,7 @@ import * as Y from 'yjs';
 import type { Config } from '../config.js';
 import type { PresenceValue } from '../presence/types.js';
 import { RoomManager } from '../room/RoomManager.js';
+import { demoSeedUpdate } from '../demo/seed.js';
 import type { Persistence } from '../persistence/persistence.js';
 import { PERSISTED_ORIGIN, REMOTE_ORIGIN, type Room } from '../room/Room.js';
 import { signResumeToken, verifyResumeToken } from '../session/resumeToken.js';
@@ -369,6 +370,11 @@ export class GatewayServer {
 
   #onRoomCreated(room: Room): void {
     room.doc.on('update', (update: Uint8Array, origin: unknown) => this.#onDocUpdate(room, update, origin));
+    // The seed is applied before anything else so the first joiner never sees
+    // an empty demo room. It is an idempotent update (see demo/seed.ts), so
+    // every instance doing this, and doing it again after a restart or
+    // alongside recovered state, converges on one copy.
+    if (room.id === this.#config.demoRoom) Y.applyUpdate(room.doc, demoSeedUpdate(), PERSISTED_ORIGIN);
     // Both load in parallel and both are CRDT merges, so neither has to wait
     // for the other for correctness. Joiners wait for both so they are not
     // shown a room that is still filling in.
