@@ -18,7 +18,10 @@ export interface FanoutBus {
   crash(): void;
 }
 
-export async function connectRedis(url: string, options: { failFast: boolean }): Promise<Redis> {
+export async function connectRedis(
+  url: string,
+  options: { failFast: boolean; logger: Logger },
+): Promise<Redis> {
   const redis = new Redis(url, {
     // With the default offline queue, commands issued while Redis is
     // unreachable pile up in memory and then all fire on reconnect: a
@@ -29,6 +32,9 @@ export async function connectRedis(url: string, options: { failFast: boolean }):
     maxRetriesPerRequest: options.failFast ? 0 : null,
     lazyConnect: true,
   });
+  // Without a listener ioredis prints every connection error to stderr and
+  // gives us no say in how they are reported.
+  redis.on('error', (err) => options.logger.warn({ err }, 'redis connection error'));
   await redis.connect();
   return redis;
 }
@@ -54,8 +60,6 @@ export class RedisBus implements FanoutBus {
         this.#logger.error({ err, channel: channel.toString() }, 'fan-out handler threw');
       }
     });
-    this.#sub.on('error', (err) => this.#logger.warn({ err }, 'redis subscriber error'));
-    this.#pub.on('error', (err) => this.#logger.warn({ err }, 'redis publisher error'));
   }
 
   async publish(channel: string, bytes: Uint8Array): Promise<number> {
@@ -74,7 +78,12 @@ export class RedisBus implements FanoutBus {
 
   async close(): Promise<void> {
     this.#handlers.clear();
-    await Promise.allSettled([this.#pub.quit(), this.#sub.quit()]);
+    // QUIT is a courtesy. With Redis unreachable it would wait on a
+    // reconnect that never comes and hang shutdown, so bound it and then
+    // drop the sockets regardless.
+    const bounded = (redis: Redis) =>
+      Promise.race([redis.quit().catch(() => undefined), new Promise((resolve) => setTimeout(resolve, 1000))]);
+    await Promise.all([bounded(this.#pub), bounded(this.#sub)]);
     this.#pub.disconnect();
     this.#sub.disconnect();
   }

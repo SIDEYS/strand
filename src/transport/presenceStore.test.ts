@@ -1,4 +1,5 @@
 import type { Redis } from 'ioredis';
+import pino from 'pino';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { PresenceValue } from '../presence/types.js';
 import { connectRedis } from './bus.js';
@@ -24,7 +25,7 @@ describe('PresenceStore (real Redis)', () => {
 
   beforeAll(async () => {
     redis = await startTestRedis();
-    client = await connectRedis(redis.url, { failFast: true });
+    client = await connectRedis(redis.url, { failFast: true, logger: pino({ level: 'silent' }) });
     store = new PresenceStore(client, TTL_MS);
   }, 120_000);
 

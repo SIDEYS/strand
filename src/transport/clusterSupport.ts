@@ -1,4 +1,5 @@
 import { createServer, type Server } from 'node:http';
+import net from 'node:net';
 import pino from 'pino';
 import { WebSocket } from 'ws';
 import * as Y from 'yjs';
@@ -101,6 +102,63 @@ export class LossyBus implements FanoutBus {
   }
 }
 
+/** A TCP proxy in front of Redis whose connections can be cut and later
+ * allowed again, to partition one instance from Redis for real: its
+ * sockets die, reconnects fail, then succeed after heal(). */
+export class TcpProxy {
+  port = 0;
+  #server: net.Server;
+  #sockets = new Set<net.Socket>();
+  #blocked = false;
+
+  constructor(targetHost: string, targetPort: number) {
+    this.#server = net.createServer((client) => {
+      if (this.#blocked) {
+        client.destroy();
+        return;
+      }
+      const upstream = net.connect(targetPort, targetHost);
+      for (const socket of [client, upstream]) {
+        this.#sockets.add(socket);
+        socket.on('close', () => this.#sockets.delete(socket));
+        socket.on('error', () => {
+          client.destroy();
+          upstream.destroy();
+        });
+      }
+      client.pipe(upstream);
+      upstream.pipe(client);
+    });
+  }
+
+  static async start(targetHost: string, targetPort: number): Promise<TcpProxy> {
+    const proxy = new TcpProxy(targetHost, targetPort);
+    await new Promise<void>((resolve) => proxy.#server.listen(0, '127.0.0.1', resolve));
+    const address = proxy.#server.address();
+    if (address === null || typeof address === 'string') throw new Error('expected AddressInfo');
+    proxy.port = address.port;
+    return proxy;
+  }
+
+  get url(): string {
+    return `redis://127.0.0.1:${this.port}`;
+  }
+
+  sever(): void {
+    this.#blocked = true;
+    for (const socket of this.#sockets) socket.destroy();
+  }
+
+  heal(): void {
+    this.#blocked = false;
+  }
+
+  async close(): Promise<void> {
+    for (const socket of this.#sockets) socket.destroy();
+    await new Promise<void>((resolve) => this.#server.close(() => resolve()));
+  }
+}
+
 export interface Instance {
   id: string;
   url: string;
@@ -128,9 +186,9 @@ export async function startInstance(
   random?: () => number,
 ): Promise<Instance> {
   const config = baseConfig({ ...FAST_TIMINGS, instanceId: id, redisUrl, ...overrides });
-  const pub = await connectRedis(redisUrl, { failFast: true });
-  const sub = await connectRedis(redisUrl, { failFast: false });
-  const data = await connectRedis(redisUrl, { failFast: true });
+  const pub = await connectRedis(redisUrl, { failFast: true, logger });
+  const sub = await connectRedis(redisUrl, { failFast: false, logger });
+  const data = await connectRedis(redisUrl, { failFast: true, logger });
   const bus = new LossyBus(new RedisBus(pub, sub, logger), random);
   const replicator = new Replicator({
     instanceId: id,
