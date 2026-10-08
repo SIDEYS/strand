@@ -22,6 +22,7 @@ import {
   encodeReconcileEnvelope,
   type Envelope,
 } from './envelope.js';
+import { noopMetrics, type MetricsSink } from '../metrics/sink.js';
 import type { PresenceStore } from './presenceStore.js';
 import { instanceOfOwner, type SessionStore } from './sessionStore.js';
 
@@ -45,6 +46,7 @@ export interface ReplicatorOptions {
   sessions: SessionStore;
   clock: HybridClock;
   logger: Logger;
+  metrics?: MetricsSink;
   reconcileIntervalMs: number;
   joinSyncTimeoutMs: number;
   random?: () => number;
@@ -99,6 +101,7 @@ export class Replicator {
   #onFence: (roomId: string, clientId: string, newOwnerId: string) => void = () => undefined;
   #clock: HybridClock;
   #logger: Logger;
+  #metrics: MetricsSink;
   #reconcileIntervalMs: number;
   #joinSyncTimeoutMs: number;
   #random: () => number;
@@ -117,6 +120,7 @@ export class Replicator {
     this.#sessions = options.sessions;
     this.#clock = options.clock;
     this.#logger = options.logger;
+    this.#metrics = options.metrics ?? noopMetrics;
     this.#reconcileIntervalMs = options.reconcileIntervalMs;
     this.#joinSyncTimeoutMs = options.joinSyncTimeoutMs;
     this.#random = options.random ?? Math.random;
@@ -217,7 +221,7 @@ export class Replicator {
       // path only: the displaced connection finds out regardless at its next
       // heartbeat, when touchSession reports it no longer owns the lease.
       this.#track(
-        this.#bus.publish(channelFor(roomId), encodeFenceEnvelope(this.instanceId, target, clientId, ownerId)),
+        this.#publish(channelFor(roomId), encodeFenceEnvelope(this.instanceId, target, clientId, ownerId)),
         'fence publish failed',
         roomId,
       );
@@ -279,6 +283,7 @@ export class Replicator {
     // because we are subscribed to the channel we publish on.
     if (env.origin === this.instanceId) return;
     if (env.target !== '' && env.target !== this.instanceId) return;
+    this.#metrics.fanoutReceived((Date.now() - env.sentAt) / 1000);
 
     if (env.kind === EnvelopeKind.Fence) {
       this.#onFence(roomId, env.clientId, env.newOwnerId);
@@ -358,7 +363,7 @@ export class Replicator {
     // Sent even when the diff has no structs: the update always carries the
     // whole delete set, which is how a lost deletion gets repaired.
     this.#track(
-      this.#bus.publish(channelFor(room.id), encodeFrameEnvelope(this.instanceId, env.origin, encodeSyncStep2(diff))),
+      this.#publish(channelFor(room.id), encodeFrameEnvelope(this.instanceId, env.origin, encodeSyncStep2(diff))),
       'reconcile reply failed',
       room.id,
     );
@@ -394,8 +399,18 @@ export class Replicator {
     if (wait.expected !== null && wait.received >= wait.expected) wait.settle();
   }
 
+  /** Every publish goes through here so its duration is measured. */
+  async #publish(channel: string, bytes: Uint8Array): Promise<number> {
+    const started = performance.now();
+    try {
+      return await this.#bus.publish(channel, bytes);
+    } finally {
+      this.#metrics.fanoutPublished((performance.now() - started) / 1000);
+    }
+  }
+
   #publishReconcile(room: Room, isJoin: boolean): Promise<number> {
-    return this.#bus.publish(
+    return this.#publish(
       channelFor(room.id),
       encodeReconcileEnvelope(
         this.instanceId,
@@ -473,7 +488,7 @@ export class Replicator {
   #publishFrame(roomId: string, frame: Uint8Array): void {
     if (this.#closed) return;
     this.#track(
-      this.#bus.publish(channelFor(roomId), encodeFrameEnvelope(this.instanceId, '', frame)),
+      this.#publish(channelFor(roomId), encodeFrameEnvelope(this.instanceId, '', frame)),
       'publish failed',
       roomId,
     );

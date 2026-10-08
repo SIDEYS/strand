@@ -4,6 +4,8 @@ import type { RoomMember } from '../room/RoomManager.js';
 import { CloseCode } from '../protocol/index.js';
 
 export interface ConnectionOptions {
+  /** Called once with the close code when the server ends this connection. */
+  onServerClose?: (code: number) => void;
   socket: WebSocket;
   clientId: string;
   ownerId: string;
@@ -53,11 +55,15 @@ export class Connection implements RoomMember {
   #backpressureThresholdBytes: number;
   #logger: Logger;
   #forceCloseTimer: NodeJS.Timeout | undefined;
+  #onServerClose: ((code: number) => void) | undefined;
+  /** The close code the server sent, if it was the one that ended this. */
+  serverCloseCode: number | null = null;
 
   constructor(options: ConnectionOptions) {
     this.#socket = options.socket;
     this.clientId = options.clientId;
     this.ownerId = options.ownerId;
+    this.#onServerClose = options.onServerClose;
     this.#backpressureThresholdBytes = options.backpressureThresholdBytes;
     this.#logger = options.logger;
     this.#socket.once('close', () => {
@@ -98,6 +104,10 @@ export class Connection implements RoomMember {
   disconnect(code: number, reason: string): void {
     if (this.#socket.readyState === this.#socket.CLOSED || this.#socket.readyState === this.#socket.CLOSING) {
       return;
+    }
+    if (this.serverCloseCode === null) {
+      this.serverCloseCode = code;
+      this.#onServerClose?.(code);
     }
     try {
       this.#socket.close(code, reason);

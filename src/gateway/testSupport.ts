@@ -45,7 +45,7 @@ export interface Harness {
 
 export async function startServer(
   config: Config,
-  extra: Partial<Pick<GatewayServerOptions, 'persistence'>> = {},
+  extra: Partial<Pick<GatewayServerOptions, 'persistence' | 'metrics'>> = {},
 ): Promise<Harness> {
   const httpServer = createServer();
   const gateway = new GatewayServer({ server: httpServer, config, logger: testLogger, ...extra });

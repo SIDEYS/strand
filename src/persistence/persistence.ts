@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { Logger } from 'pino';
 import * as Y from 'yjs';
 import { PERSISTED_ORIGIN, type Room } from '../room/Room.js';
+import { noopMetrics, type MetricsSink } from '../metrics/sink.js';
 import type { DocumentStore } from './documentStore.js';
 
 export interface PersistenceOptions {
@@ -29,6 +30,7 @@ export interface PersistenceOptions {
    * whenever it arrives, so a slow database delays nothing but its own
    * contribution. Default 3000. */
   recoveryTimeoutMs?: number;
+  metrics?: MetricsSink;
   random?: () => number;
 }
 
@@ -139,11 +141,13 @@ export class Persistence {
   #chains = new Map<string, Promise<void>>();
   #flushTimer: NodeJS.Timeout | undefined;
   #random: () => number;
+  #metrics: MetricsSink;
   #closed = false;
 
   constructor(options: PersistenceOptions) {
     this.#options = options;
     this.#random = options.random ?? Math.random;
+    this.#metrics = options.metrics ?? noopMetrics;
     this.#flushTimer = setInterval(() => this.#flushAll(), options.flushIntervalMs);
   }
 
@@ -228,6 +232,7 @@ export class Persistence {
       state.pendingBytes += update.length;
       if (state.pending.length > this.#options.maxPendingOps || state.pendingBytes > this.#options.maxPendingBytes) {
         this.stats.opsDropped += state.pending.length;
+        this.#metrics.opsDropped(state.pending.length);
         state.pending = [];
         state.pendingBytes = 0;
         // The snapshot captures everything those ops held.
@@ -286,12 +291,14 @@ export class Persistence {
       this.stats.opsWritten += batch.length;
     } catch (err) {
       this.stats.flushFailures += 1;
+      this.#metrics.flushFailed();
       this.#options.logger.warn({ err, roomId: state.room.id }, 'op flush failed; will retry');
       // Anything buffered since is newer; put the failed batch back first.
       state.pending = [...batch, ...state.pending];
       state.pendingBytes += bytes;
       if (state.pending.length > this.#options.maxPendingOps || state.pendingBytes > this.#options.maxPendingBytes) {
         this.stats.opsDropped += state.pending.length;
+        this.#metrics.opsDropped(state.pending.length);
         state.pending = [];
         state.pendingBytes = 0;
       }
@@ -341,12 +348,16 @@ export class Persistence {
         );
         if (version === null) {
           this.stats.snapshotConflicts += 1;
+          this.#metrics.snapshotConflict();
           continue;
         }
         this.stats.snapshots += 1;
         this.stats.lastSnapshotMs = performance.now() - started;
+        this.#metrics.snapshot(this.stats.lastSnapshotMs / 1000);
         this.#markClean(state, seqAtStart);
-        this.stats.opsCompacted += await store.compact(state.room.id, version - retentionVersions);
+        const compacted = await store.compact(state.room.id, version - retentionVersions);
+        this.stats.opsCompacted += compacted;
+        this.#metrics.opsCompacted(compacted);
         return;
       }
       this.#options.logger.warn({ roomId: state.room.id }, 'snapshot kept losing the version race; will retry later');

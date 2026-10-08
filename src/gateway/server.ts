@@ -9,6 +9,7 @@ import { RoomManager } from '../room/RoomManager.js';
 import { demoSeedUpdate } from '../demo/seed.js';
 import type { Persistence } from '../persistence/persistence.js';
 import { PERSISTED_ORIGIN, REMOTE_ORIGIN, type Room } from '../room/Room.js';
+import { disconnectReason, noopMetrics, type MetricsSink } from '../metrics/sink.js';
 import { signResumeToken, verifyResumeToken } from '../session/resumeToken.js';
 import { HybridClock } from '../transport/clock.js';
 import type { Replicator } from '../transport/replicator.js';
@@ -39,6 +40,7 @@ export interface GatewayServerOptions {
   fanout?: Replicator;
   /** Write-behind persistence. Omit to keep rooms in memory only. */
   persistence?: Persistence;
+  metrics?: MetricsSink;
   clock?: HybridClock;
 }
 
@@ -57,6 +59,7 @@ export class GatewayServer {
   #heartbeatTimer: NodeJS.Timeout;
   #fanout: Replicator | undefined;
   #persistence: Persistence | undefined;
+  #metrics: MetricsSink;
   #clock: HybridClock;
 
   constructor(options: GatewayServerOptions) {
@@ -64,6 +67,7 @@ export class GatewayServer {
     this.#logger = options.logger;
     this.#fanout = options.fanout;
     this.#persistence = options.persistence;
+    this.#metrics = options.metrics ?? noopMetrics;
     this.#clock = options.clock ?? new HybridClock();
     this.#rooms = new RoomManager({
       onRoomCreated: (room) => this.#onRoomCreated(room),
@@ -91,6 +95,10 @@ export class GatewayServer {
       // if that check is ever bypassed, e.g. by a bug.
       maxPayload: options.config.maxInboundMessageBytes * 4,
     });
+    // Lets a load tester (or an operator with curl -i) see which instance a
+    // connection landed on, which is how same-instance and cross-instance
+    // pairs are told apart behind a load balancer.
+    this.#wss.on('headers', (headers) => headers.push(`X-Strand-Instance: ${this.#config.instanceId}`));
     this.#wss.on('connection', (socket) => this.#onConnection(socket));
     this.#heartbeatTimer = setInterval(() => this.#tickHeartbeat(), this.#config.heartbeatIntervalMs);
   }
@@ -103,13 +111,23 @@ export class GatewayServer {
     return this.#connections.size;
   }
 
+  roomCount(): number {
+    return this.#rooms.roomCount();
+  }
+
+  /** Closes a socket that never completed the handshake, and counts why. */
+  #reject(socket: WebSocket, code: number, reason: string): void {
+    this.#metrics.disconnect(disconnectReason(code));
+    socket.close(code, reason);
+  }
+
   #onConnection(socket: WebSocket): void {
     let connection: Connection | null = null;
     let handshaking = false;
 
     socket.on('message', (data, isBinary) => {
       if (!isBinary) {
-        socket.close(CloseCode.BadMessage, 'text frames are not supported');
+        this.#reject(socket, CloseCode.BadMessage, 'text frames are not supported');
         return;
       }
       const bytes = Buffer.isBuffer(data)
@@ -119,7 +137,7 @@ export class GatewayServer {
           : Buffer.concat(data);
 
       if (bytes.length > this.#config.maxInboundMessageBytes) {
-        socket.close(CloseCode.MessageTooLarge, 'message exceeds size limit');
+        this.#reject(socket, CloseCode.MessageTooLarge, 'message exceeds size limit');
         return;
       }
 
@@ -128,7 +146,7 @@ export class GatewayServer {
         decoded = decode(bytes);
       } catch (err) {
         const reason = err instanceof ProtocolDecodeError ? err.message : 'malformed message';
-        socket.close(CloseCode.BadMessage, reason);
+        this.#reject(socket, CloseCode.BadMessage, reason);
         return;
       }
 
@@ -140,7 +158,7 @@ export class GatewayServer {
         // The handshake now awaits Redis, so there is a window where the
         // client hasn't been welcomed yet. A well-behaved client waits for
         // WELCOME before sending anything.
-        socket.close(CloseCode.BadMessage, 'message sent before WELCOME');
+        this.#reject(socket, CloseCode.BadMessage, 'message sent before WELCOME');
         return;
       }
       handshaking = true;
@@ -169,15 +187,15 @@ export class GatewayServer {
     assign: (connection: Connection) => void,
   ): Promise<void> {
     if (decoded.type !== MessageType.Hello) {
-      socket.close(CloseCode.BadMessage, 'expected HELLO as first message');
+      this.#reject(socket, CloseCode.BadMessage, 'expected HELLO as first message');
       return;
     }
     if (decoded.protocolVersion !== PROTOCOL_VERSION || decoded.roomId === null) {
-      socket.close(CloseCode.ProtocolVersionMismatch, `server speaks protocol version ${PROTOCOL_VERSION}`);
+      this.#reject(socket, CloseCode.ProtocolVersionMismatch, `server speaks protocol version ${PROTOCOL_VERSION}`);
       return;
     }
     if (decoded.roomId.length === 0) {
-      socket.close(CloseCode.BadMessage, 'roomId must not be empty');
+      this.#reject(socket, CloseCode.BadMessage, 'roomId must not be empty');
       return;
     }
     const roomId = decoded.roomId;
@@ -189,12 +207,14 @@ export class GatewayServer {
     // what a client whose token lapsed during a long outage should be.
     let clientId: string = randomUUID();
     let resumed = false;
+    let tokenRejected = false;
     if (decoded.resumeToken !== null) {
       const verdict = verifyResumeToken(this.#config.resumeSecret, decoded.resumeToken, roomId, Date.now());
       if (verdict.ok) {
         clientId = verdict.claims.clientId;
         resumed = true;
       } else {
+        tokenRejected = true;
         this.#logger.debug({ reason: verdict.reason, roomId }, 'resume token rejected; joining as a new user');
       }
     }
@@ -203,6 +223,7 @@ export class GatewayServer {
       socket,
       clientId,
       ownerId: makeOwnerId(this.#config.instanceId, randomUUID()),
+      onServerClose: (code) => this.#metrics.disconnect(disconnectReason(code)),
       backpressureThresholdBytes: this.#config.backpressureThresholdBytes,
       logger: this.#logger,
     });
@@ -224,6 +245,7 @@ export class GatewayServer {
     // finished joining while this one waited.
     if (resumed) this.#fenceLocalDuplicate(roomId, clientId, connection);
 
+    this.#metrics.handshake(resumed ? 'resumed' : tokenRejected ? 'token_rejected' : 'new');
     this.#connections.add(connection);
     assign(connection);
     const room = this.#rooms.join(roomId, connection);
@@ -391,6 +413,7 @@ export class GatewayServer {
    * peer from being published straight back out. */
   #onDocUpdate(room: Room, update: Uint8Array, origin: unknown): void {
     const frame = encodeDocUpdate(update);
+    this.#metrics.docUpdate(origin === REMOTE_ORIGIN ? 'remote' : origin === PERSISTED_ORIGIN ? 'persisted' : 'local');
     // Neither a peer's update nor state read back from Postgres is ours to
     // publish: the first is already being fanned out by its origin, and the
     // second is this instance's own database read.
@@ -416,6 +439,7 @@ export class GatewayServer {
   #handleDeparture(connection: Connection): void {
     if (connection.departed || !connection.roomId) return;
     connection.departed = true;
+    if (connection.serverCloseCode === null) this.#metrics.disconnect('client_closed');
     this.#connections.delete(connection);
     const room = this.#rooms.getRoom(connection.roomId);
 
