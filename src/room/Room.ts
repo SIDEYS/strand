@@ -9,6 +9,11 @@ import type { RoomMember } from './RoomManager.js';
  * be published again, or every instance would echo every update forever. */
 export const REMOTE_ORIGIN = Symbol('remote-origin');
 
+/** Transaction origin for state loaded back from Postgres. It is already
+ * durable, so it must not be written to the op log again, and it came from
+ * this instance's own database read, not a peer, so it is not published. */
+export const PERSISTED_ORIGIN = Symbol('persisted-origin');
+
 /**
  * Everything a single room needs, held in memory on this instance: its Yjs
  * document, its presence set, and its connected members. Losing this state
