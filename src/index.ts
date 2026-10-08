@@ -49,7 +49,14 @@ if (config.redisUrl) {
 let pool: pg.Pool | undefined;
 let persistence: Persistence | undefined;
 if (config.databaseUrl) {
-  pool = new pg.Pool({ connectionString: config.databaseUrl, max: 10 });
+  // Timeouts so a hung database fails queries (which the persistence layer
+  // retries or tolerates) instead of holding them open indefinitely.
+  pool = new pg.Pool({
+    connectionString: config.databaseUrl,
+    max: 10,
+    connectionTimeoutMillis: 5000,
+    query_timeout: 15_000,
+  });
   pool.on('error', (err) => logger.warn({ err }, 'postgres pool error'));
   persistence = new Persistence({
     store: new DocumentStore(pool),

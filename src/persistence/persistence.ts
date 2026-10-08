@@ -24,6 +24,11 @@ export interface PersistenceOptions {
    * Postgres is slow or down. */
   maxPendingOps: number;
   maxPendingBytes: number;
+  /** How long joiners wait for the database before the room is served from
+   * what peers have. Loading carries on in the background and merges in
+   * whenever it arrives, so a slow database delays nothing but its own
+   * contribution. Default 3000. */
+  recoveryTimeoutMs?: number;
   random?: () => number;
 }
 
@@ -139,7 +144,7 @@ export class Persistence {
   constructor(options: PersistenceOptions) {
     this.#options = options;
     this.#random = options.random ?? Math.random;
-    this.#flushTimer = setInterval(() => void this.#flushAll(), options.flushIntervalMs);
+    this.#flushTimer = setInterval(() => this.#flushAll(), options.flushIntervalMs);
   }
 
   /** Recovers the room from Postgres, then starts tracking its changes.
@@ -161,13 +166,27 @@ export class Persistence {
       };
       room.doc.on('update', state.onUpdate);
       this.#rooms.set(room.id, state);
-      try {
-        await this.#options.store.ensureDocument(room.id);
-        const result = await this.recover(room.id, room.doc);
-        this.#options.logger.info({ roomId: room.id, ...result }, 'room recovered from postgres');
-      } catch (err) {
-        this.#options.logger.error({ err, roomId: room.id }, 'recovery failed; serving without persisted state');
-      }
+      const recovery = (async () => {
+        try {
+          await this.#options.store.ensureDocument(room.id);
+          const result = await this.recover(room.id, room.doc);
+          this.#options.logger.info({ roomId: room.id, ...result }, 'room recovered from postgres');
+        } catch (err) {
+          this.#options.logger.error({ err, roomId: room.id }, 'recovery failed; serving without persisted state');
+        }
+      })();
+      // Joiners wait for the database, but not forever. If it is slow or
+      // down the room opens with whatever peers have, and the persisted
+      // state merges in whenever (if ever) the read completes.
+      let timer: NodeJS.Timeout | undefined;
+      const timedOut = new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          this.#options.logger.warn({ roomId: room.id }, 'recovery is slow; opening the room without it for now');
+          resolve();
+        }, this.#options.recoveryTimeoutMs ?? 3000);
+      });
+      await Promise.race([recovery, timedOut]);
+      clearTimeout(timer);
     });
   }
 
@@ -232,9 +251,10 @@ export class Persistence {
     clearTimeout(state.snapshotTimer);
     state.snapshotTimer = setTimeout(() => {
       state.snapshotTimer = undefined;
-      void this.#serialize(state.room.id, async () => {
+      // On its own chain, not behind the op flush: a snapshot supersedes the
+      // buffered ops, so a stalled flush must not be able to hold it up.
+      void this.#serialize(`${state.room.id}#snapshot`, async () => {
         if (this.#rooms.get(state.room.id) !== state) return;
-        await this.#flush(state);
         await this.#snapshot(state);
         if (state.updateSeq !== state.cleanSeq && !this.#closed) {
           this.#scheduleSnapshot(state, this.#options.snapshotIntervalMs * (0.7 + 0.6 * this.#random()));
@@ -243,10 +263,10 @@ export class Persistence {
     }, delayMs);
   }
 
-  async #flushAll(): Promise<void> {
+  #flushAll(): void {
     for (const state of [...this.#rooms.values()]) {
       if (state.pending.length === 0) continue;
-      await this.#serialize(state.room.id, () => this.#flush(state));
+      void this.#serialize(`${state.room.id}#ops`, () => this.#flush(state));
     }
   }
 
@@ -343,8 +363,10 @@ export class Persistence {
 
   /** Flush and snapshot whatever a room still owes. */
   async #settle(state: RoomState): Promise<void> {
-    await this.#flush(state);
-    if (state.updateSeq !== state.cleanSeq) await this.#snapshot(state);
+    await this.#serialize(`${state.room.id}#ops`, () => this.#flush(state));
+    if (state.updateSeq !== state.cleanSeq) {
+      await this.#serialize(`${state.room.id}#snapshot`, () => this.#snapshot(state));
+    }
   }
 
   /** Per-document ordering: a room dropped and re-created on this instance
