@@ -1,21 +1,53 @@
 import { createReadStream } from 'node:fs';
 import Fastify from 'fastify';
 import type { Logger } from 'pino';
+import type { PromMetrics } from '../metrics/prom.js';
+import type { ReadinessReport } from './readiness.js';
 import { resolveStaticFile } from './static.js';
 
 export interface ApiOptions {
   /** Directory of the built web client. Omit to serve only the API. */
   staticRoot?: string;
+  /** Serves GET /metrics. */
+  metrics?: PromMetrics;
+  /** Backs GET /readyz. Omit when there are no dependencies to check. */
+  readiness?: () => Promise<ReadinessReport>;
+  /** Echoed as X-Strand-Instance on every response. */
+  instanceId?: string;
 }
 
 export function buildApiServer(logger: Logger, options: ApiOptions = {}) {
   const app = Fastify({ loggerInstance: logger });
 
-  // Deliberately just a 200. Phase 7 splits this into /healthz (process
-  // alive) vs /readyz (Redis/Postgres reachable) — a readiness check that
-  // always returns healthy without actually checking anything would be
-  // worse than no check at all, so it isn't added until it can be real.
+  const { instanceId } = options;
+  if (instanceId !== undefined) {
+    app.addHook('onSend', (_request, reply, payload, done) => {
+      reply.header('x-strand-instance', instanceId);
+      done(null, payload);
+    });
+  }
+
+  // Liveness: is the process up and its event loop answering. It checks
+  // nothing else on purpose. If this failed whenever Redis did, an
+  // orchestrator would restart healthy instances during a Redis outage and
+  // drop every socket they were still serving. See /readyz for the other
+  // question.
   app.get('/healthz', () => ({ status: 'ok' }));
+
+  // Readiness: should this instance be given NEW traffic? Not ready (503) when
+  // a configured dependency is unreachable. The process stays up and keeps
+  // serving existing connections.
+  app.get('/readyz', async (_request, reply) => {
+    const report = options.readiness
+      ? await options.readiness()
+      : { ready: true, checks: { redis: 'disabled', postgres: 'disabled' } };
+    return reply.code(report.ready ? 200 : 503).send({ status: report.ready ? 'ready' : 'not_ready', ...report.checks });
+  });
+
+  const { metrics } = options;
+  if (metrics !== undefined) {
+    app.get('/metrics', async (_request, reply) => reply.type(metrics.contentType).send(await metrics.render()));
+  }
 
   const { staticRoot } = options;
   if (staticRoot !== undefined) {

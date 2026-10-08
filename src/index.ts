@@ -3,8 +3,10 @@ import path from 'node:path';
 import pg from 'pg';
 import pino from 'pino';
 import { loadConfig } from './config.js';
+import { createReadiness } from './api/readiness.js';
 import { buildApiServer } from './api/server.js';
 import { GatewayServer } from './gateway/server.js';
+import { PromMetrics } from './metrics/prom.js';
 import { DocumentStore } from './persistence/documentStore.js';
 import { Persistence } from './persistence/persistence.js';
 import { RedisBus, connectRedis } from './transport/bus.js';
@@ -22,8 +24,7 @@ if (config.resumeSecretIsEphemeral) {
 
 const staticRoot = existsSync(path.join(config.webRoot, 'index.html')) ? path.resolve(config.webRoot) : undefined;
 if (staticRoot === undefined) logger.warn({ webRoot: config.webRoot }, 'no built web client found; serving the API only (run: npm run build:web)');
-const api = buildApiServer(logger, staticRoot ? { staticRoot } : {});
-await api.ready();
+const metrics = new PromMetrics(config.instanceId);
 
 const clock = new HybridClock();
 let fanout: Replicator | undefined;
@@ -43,6 +44,7 @@ if (config.redisUrl) {
     sessions: new SessionStore(dataRedis, config.presenceTtlMs),
     clock,
     logger,
+    metrics,
     reconcileIntervalMs: config.reconcileIntervalMs,
     joinSyncTimeoutMs: config.joinSyncTimeoutMs,
   });
@@ -72,19 +74,39 @@ if (config.databaseUrl) {
     retentionVersions: config.opRetentionVersions,
     maxPendingOps: config.maxPendingOps,
     maxPendingBytes: 8 * 1024 * 1024,
+    metrics,
   });
 } else {
   logger.warn('DATABASE_URL not set: documents are not persisted and are lost when every instance of a room stops');
 }
 
+// Probes are only built for dependencies this instance is configured to use.
+const redisForProbe = dataRedis;
+const poolForProbe = pool;
+const readiness = createReadiness({
+  ...(redisForProbe ? { redis: () => redisForProbe.ping() } : {}),
+  ...(poolForProbe ? { postgres: () => poolForProbe.query('SELECT 1') } : {}),
+});
+
+const api = buildApiServer(logger, {
+  ...(staticRoot ? { staticRoot } : {}),
+  metrics,
+  readiness,
+  instanceId: config.instanceId,
+});
+await api.ready();
+
 const gateway = new GatewayServer({
   server: api.server,
   config,
   logger,
+  metrics,
   clock,
   ...(fanout ? { fanout } : {}),
   ...(persistence ? { persistence } : {}),
 });
+
+metrics.bindGauges({ sockets: () => gateway.connectionCount(), rooms: () => gateway.roomCount() });
 
 await api.listen({ host: config.host, port: config.port });
 logger.info({ host: config.host, port: config.port, fanout: fanout !== undefined, persistence: persistence !== undefined }, 'strand gateway listening');
