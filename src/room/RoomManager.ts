@@ -10,26 +10,44 @@ export interface RoomMember {
   send(bytes: Uint8Array): void;
 }
 
+export interface RoomLifecycleHooks {
+  /** Fires synchronously when a room is first created on this instance,
+   * before the first member is added. */
+  onRoomCreated?(room: Room): void;
+  /** Fires when the last local member leaves and the room is dropped. */
+  onRoomDestroyed?(room: Room): void;
+}
+
 /**
  * Tracks rooms — membership, Yjs doc, presence set — in memory, for a
- * single instance. Phase 1/2 are intentionally this simple; Phase 3 is
- * where room state has to become cross-instance aware via Redis, and this
- * class stays the local-instance half of that picture.
+ * single instance. A room exists on an instance only while it has local
+ * members; cross-instance state is the Replicator's job, attached through
+ * the lifecycle hooks.
  */
 export class RoomManager {
   #rooms = new Map<string, Room>();
+  #hooks: RoomLifecycleHooks;
+
+  constructor(hooks: RoomLifecycleHooks = {}) {
+    this.#hooks = hooks;
+  }
 
   getOrCreateRoom(roomId: string): Room {
     let room = this.#rooms.get(roomId);
     if (!room) {
       room = new Room(roomId);
       this.#rooms.set(roomId, room);
+      this.#hooks.onRoomCreated?.(room);
     }
     return room;
   }
 
   getRoom(roomId: string): Room | undefined {
     return this.#rooms.get(roomId);
+  }
+
+  rooms(): IterableIterator<Room> {
+    return this.#rooms.values();
   }
 
   join(roomId: string, member: RoomMember): Room {
@@ -42,18 +60,16 @@ export class RoomManager {
     const room = this.#rooms.get(roomId);
     if (!room) return;
     room.members.delete(clientId);
-    if (room.members.size === 0) this.#rooms.delete(roomId);
+    if (room.members.size === 0) {
+      this.#rooms.delete(roomId);
+      this.#hooks.onRoomDestroyed?.(room);
+    }
   }
 
   /** Sends `bytes` to every member of `roomId` except `excludeClientId`
    * (typically the sender, so it doesn't get an echo of its own message). */
   broadcast(roomId: string, bytes: Uint8Array, excludeClientId?: string): void {
-    const room = this.#rooms.get(roomId);
-    if (!room) return;
-    for (const member of room.members.values()) {
-      if (member.clientId === excludeClientId) continue;
-      member.send(bytes);
-    }
+    this.#rooms.get(roomId)?.broadcast(bytes, excludeClientId);
   }
 
   roomSize(roomId: string): number {
