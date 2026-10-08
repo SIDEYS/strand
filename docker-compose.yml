@@ -1,3 +1,40 @@
+# Local multi-instance Strand: three stateless instances behind nginx, sharing
+# one Redis (fan-out, presence, session leases) and one Postgres (documents).
+#
+#   docker compose up --build
+#   open http://localhost:8080/r/demo   (in two windows)
+#
+# The instances are interchangeable and nginx does plain round-robin, so your
+# two windows will usually land on different instances. That is the point.
+
+x-strand: &strand
+  build: .
+  image: strand:local
+  restart: unless-stopped
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+    redis:
+      condition: service_healthy
+    postgres:
+      condition: service_healthy
+
+x-strand-env: &strand-env
+  PORT: '8080'
+  REDIS_URL: redis://redis:6379
+  DATABASE_URL: postgres://strand:strand@postgres:5432/strand
+  # LOCAL DEVELOPMENT ONLY. Every instance must share one secret; this default
+  # exists so `docker compose up` works from a clean clone. Anyone who knows it
+  # can mint resume tokens, so set a real one for anything that is not on your
+  # own machine:  RESUME_SECRET=$(openssl rand -base64 32) docker compose up
+  RESUME_SECRET: ${RESUME_SECRET:-local-development-only-secret-change-me-before-deploying}
+  # Shorten these to see offline detection quickly, e.g.
+  #   HEARTBEAT_INTERVAL_MS=3000 PRESENCE_TTL_MS=9000 docker compose up
+  HEARTBEAT_INTERVAL_MS: ${HEARTBEAT_INTERVAL_MS:-15000}
+  PRESENCE_TTL_MS: ${PRESENCE_TTL_MS:-45000}
+  RECONCILE_INTERVAL_MS: ${RECONCILE_INTERVAL_MS:-5000}
+  LOG_LEVEL: ${LOG_LEVEL:-warn}
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -6,24 +43,81 @@ services:
       POSTGRES_PASSWORD: strand
       POSTGRES_DB: strand
     ports:
-      - '5432:5432'
+      - '127.0.0.1:5432:5432'
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ['CMD-SHELL', 'pg_isready -U strand']
-      interval: 5s
-      timeout: 5s
-      retries: 5
+      interval: 3s
+      timeout: 3s
+      retries: 20
 
   redis:
     image: redis:7-alpine
     ports:
-      - '6379:6379'
+      - '127.0.0.1:6379:6379'
     healthcheck:
       test: ['CMD', 'redis-cli', 'ping']
-      interval: 5s
-      timeout: 5s
-      retries: 5
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Applies the schema, then exits. The instances wait for it to finish.
+  migrate:
+    build: .
+    image: strand:local
+    command:
+      - node
+      - node_modules/node-pg-migrate/bin/node-pg-migrate.js
+      - up
+      - --migrations-dir
+      - migrations
+      - --migrations-table
+      - pgmigrations
+    environment:
+      DATABASE_URL: postgres://strand:strand@postgres:5432/strand
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+
+  strand-1:
+    <<: *strand
+    environment:
+      <<: *strand-env
+      INSTANCE_ID: strand-1
+    ports:
+      - '127.0.0.1:8081:8080' # direct access, for metrics and debugging
+
+  strand-2:
+    <<: *strand
+    environment:
+      <<: *strand-env
+      INSTANCE_ID: strand-2
+    ports:
+      - '127.0.0.1:8082:8080'
+
+  strand-3:
+    <<: *strand
+    environment:
+      <<: *strand-env
+      INSTANCE_ID: strand-3
+    ports:
+      - '127.0.0.1:8083:8080'
+
+  lb:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - '8080:80'
+    depends_on:
+      strand-1:
+        condition: service_healthy
+      strand-2:
+        condition: service_healthy
+      strand-3:
+        condition: service_healthy
 
 volumes:
   postgres-data:
