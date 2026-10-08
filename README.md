@@ -66,6 +66,34 @@ Looping on a version mismatch would be a denial of service against your own
 server, and two tabs that each reconnected after being superseded would evict
 each other forever.
 
+## The client
+
+A split-pane Markdown editor (CodeMirror 6 on the left, a sanitised live preview
+on the right, scrolled in step) with collaborators' cursors and selections drawn
+in the source pane in their colour with a name label, a presence bar, a
+connection indicator, a room picker, and a shareable URL per room (`/r/<room>`).
+The `demo` room is seeded with a walkthrough that says what to try.
+
+The part worth reading is how it is built. The protocol, resume, sync,
+reconnect, and liveness logic lives in one framework-free core
+(`src/client/core.ts`) that is handed its socket, its clock, and its randomness.
+The browser passes the native `WebSocket` and window timers; the integration
+tests pass `ws` and the system clock; the unit tests pass fakes and a clock they
+advance by hand. So the tests exercise the code the browser actually runs, and
+ESLint fails the build if the core reaches for a timer, `Date`, `Math.random`,
+the DOM, a Node built-in, or React. See
+[ADR 0005](docs/adr/0005-shared-client-core-and-liveness.md).
+
+- **Cursors are relative positions**, not offsets, so a remote caret stays on the
+  character it is on while someone inserts above it.
+- **Offline is detected from heartbeat liveness**, not from the socket. A socket
+  can stay open through a dead network, so a connection that goes silent is
+  treated as dead and the indicator says so. Typing keeps working locally, the
+  indicator counts the edits saved in the window, and they merge on reconnect.
+- **The preview is an XSS sink** (it renders what other people typed) and goes
+  through DOMPurify with scripts, event handlers, `javascript:` URLs, styles, and
+  frames removed.
+
 ## Persistence
 
 Rooms live in instance memory and are written to Postgres **behind** the edit
@@ -163,6 +191,21 @@ tests and runs actually produced.
   clients still see each other's edits immediately, and a hung database read
   does not stop a room from opening.
 
+- **In a real browser, two windows.** Typing in one appears in the other, with a
+  coloured caret and name label; a caret stayed on its character after text was
+  inserted above it. With the server frozen (`SIGSTOP`: every socket stays open,
+  nothing answers) and a 2 s heartbeat, the indicator changed to Offline about
+  3 s later with no "reconnecting" step in between. Both windows kept accepting
+  edits while offline, and 100 ms after the server resumed both reconnected,
+  resumed as the **same client IDs** (the server log shows `resumed=true`), and
+  merged each other's offline edits with no duplicate presence entry. A page
+  reload also resumed as the same person. Hostile Markdown (`<img onerror>`,
+  `<script>`, a `javascript:` link, `<style>`, `<iframe>`) was neutralised in the
+  live DOM and no handler ran.
+- **The integration suites drive the shipped client core**, not a test-only
+  reimplementation. Deliberately breaking the core's handover of offline edits
+  fails three real-infrastructure tests.
+
 The suites that involve timing were run repeatedly with no failures: the
 replication suite 20 times, the resume suites 20 times, and the persistence
 suites (24 tests) 15 times.
@@ -176,6 +219,7 @@ cp .env.example .env
 # Every instance must share one resume secret (required when REDIS_URL is set):
 echo "RESUME_SECRET=$(openssl rand -base64 32)" >> .env
 npm run build
+npm run build:web          # the browser client, served by the gateway at /
 # Create the tables (reads DATABASE_URL):
 DATABASE_URL=postgres://strand:strand@localhost:5432/strand npm run migrate
 # several instances against one Redis, on different ports:
@@ -184,7 +228,9 @@ PORT=8082 node --env-file=.env dist/index.js &
 ```
 
 Without `REDIS_URL` a single instance runs standalone and generates a
-throwaway resume secret. Without `DATABASE_URL` nothing is persisted.
+throwaway resume secret. Without `DATABASE_URL` nothing is persisted. Then open
+<http://localhost:8081/r/demo> in two windows. (`npm run dev:web` runs the client
+under Vite with hot reload, proxying to a gateway on port 8080.)
 
 ## Tests
 
@@ -231,6 +277,21 @@ These are known and deliberate, not oversights.
 - **The op log and document history grow.** Compaction bounds the log, but a
   document's CRDT history only grows as it is edited, documents are never
   deleted, and every snapshot stores the whole document.
+- **Offline edits live in the page's memory.** They survive going offline and
+  reconnecting, but not closing or reloading the tab while offline: the local
+  document is not saved to IndexedDB.
+- **Offline detection takes about 1.5 heartbeat intervals.** With the default
+  15 s heartbeat the indicator says Offline after roughly 24 s of silence. A
+  shorter `HEARTBEAT_INTERVAL_MS` makes it faster at the cost of more traffic.
+- **The client bundle is large**: about 921 KB (306 KB gzipped), mostly
+  CodeMirror, Markdown, and the sanitiser, in a single chunk with no code
+  splitting.
+- **Scroll sync is proportional**, not tied to source lines, so it drifts on
+  documents whose rendered height differs a lot from their source height.
+- **Windows of one browser share a saved display name and colour** (they are
+  stored per browser, not per tab), so two of your own windows look like the same
+  person until one is renamed.
+
 - **Compaction safety is a timing assumption, not a proof.** It relies on
   instances holding a change snapshotting within a bounded time; the narrow
   conditions under which a change could be lost are in ADR 0004.
