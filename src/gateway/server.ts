@@ -19,6 +19,7 @@ import {
   encodePing,
   encodePresenceBroadcast,
   encodePresenceRemove,
+  encodeSyncStep1,
   encodeSyncStep2,
   encodeDocUpdate,
   encodeWelcome,
@@ -235,6 +236,11 @@ export class GatewayServer {
       return;
     }
     connection.send(encodeSyncStep2(diff));
+    // The other half of the exchange. Without the server's state vector a
+    // client that may hold edits the server lacks (anything typed while it
+    // was disconnected) has nothing to diff against and would have to push
+    // its whole document. With it, the client sends exactly what's missing.
+    connection.send(encodeSyncStep1(Y.encodeStateVector(room.doc)));
   }
 
   #handleDocUpdate(connection: Connection, room: Room, update: Uint8Array): void {

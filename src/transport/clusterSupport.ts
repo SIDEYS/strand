@@ -24,6 +24,9 @@ import { Replicator } from './replicator.js';
 
 const logger = pino({ level: 'silent' });
 
+/** A Yjs update with no structs and an empty delete set is two bytes. */
+const EMPTY_UPDATE_BYTES = 2;
+
 export function mulberry32(seed: number): () => number {
   let a = seed;
   return () => {
@@ -254,12 +257,14 @@ export class TestClient {
             break;
           case MessageType.SyncStep2:
             Y.applyUpdate(this.doc, msg.update, 'remote');
-            // The server never sends its own state vector, so a client that
-            // may hold edits the server lacks pushes its full state. Wasteful
-            // but idempotent; Phase 4 replaces this with a real exchange.
-            this.ws.send(encodeDocUpdate(Y.encodeStateAsUpdate(this.doc)));
             resolve();
             break;
+          case MessageType.SyncStep1: {
+            // The server's state vector: send back only what it lacks.
+            const missing = Y.encodeStateAsUpdate(this.doc, msg.stateVector);
+            if (missing.length > EMPTY_UPDATE_BYTES) this.ws.send(encodeDocUpdate(missing));
+            break;
+          }
           case MessageType.DocUpdate:
             Y.applyUpdate(this.doc, msg.update, 'remote');
             break;

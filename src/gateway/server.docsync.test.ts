@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { WebSocket } from 'ws';
 import * as Y from 'yjs';
 import { MessageType, decode, encodeDocUpdate, encodeHello, encodeSyncStep1 } from '../protocol/index.js';
-import { baseConfig, startServer, type Harness } from './testSupport.js';
+import { baseConfig, joinRoom, startServer, type Harness } from './testSupport.js';
 
 /** A minimal stand-in for the real Phase 6 client: a Yjs doc wired to a
  * WebSocket using our protocol, sending local updates and applying remote
@@ -90,6 +90,39 @@ describe('GatewayServer Yjs document sync', () => {
 
     a.close();
     b.close();
+  });
+
+  it('follows SYNC_STEP2 with its own state vector, so the client can send only what the server lacks', async () => {
+    harness = await startServer(baseConfig());
+    const author = new TestClient(harness.url, 'room-sv');
+    await author.ready;
+    author.doc.getText('content').insert(0, 'on the server');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    // A client that kept its doc across a disconnect and has one local edit
+    // the server has never seen.
+    const local = new Y.Doc();
+    const { ws, messages } = await joinRoom(harness.url, 'room-sv');
+    ws.send(encodeSyncStep1(Y.encodeStateVector(local)));
+    const step2 = await messages.next();
+    const step1 = await messages.next();
+    expect(step2.type).toBe(MessageType.SyncStep2);
+    expect(step1.type).toBe(MessageType.SyncStep1);
+    if (step2.type !== MessageType.SyncStep2 || step1.type !== MessageType.SyncStep1) throw new Error('unreachable');
+
+    Y.applyUpdate(local, step2.update, 'remote');
+    local.getText('content').insert(0, 'offline edit ');
+    const missing = Y.encodeStateAsUpdate(local, step1.stateVector);
+
+    // The diff against the server's vector is the offline edit alone, far
+    // smaller than the whole document.
+    expect(missing.length).toBeLessThan(Y.encodeStateAsUpdate(local).length);
+    ws.send(encodeDocUpdate(missing));
+    await waitUntil(() => author.text().includes('offline edit '), 3000);
+    expect(author.text()).toContain('on the server');
+
+    author.close();
+    ws.close();
   });
 
   it('two clients converge to identical document state after concurrent edits', async () => {
