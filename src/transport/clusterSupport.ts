@@ -9,6 +9,7 @@ import { GatewayServer } from '../gateway/server.js';
 import type { PresenceValue } from '../presence/types.js';
 import {
   MessageType,
+  PROTOCOL_VERSION,
   decode,
   encodeDocUpdate,
   encodeHello,
@@ -16,6 +17,12 @@ import {
   encodePresenceUpdate,
   encodeSyncStep1,
 } from '../protocol/index.js';
+import {
+  step,
+  type ConnectionEvent,
+  type ConnectionState,
+  type ReconnectPolicy,
+} from '../protocol/reconnect.js';
 import { RedisBus, connectRedis, type FanoutBus } from './bus.js';
 import { HybridClock } from './clock.js';
 import { EnvelopeKind, decodeEnvelope } from './envelope.js';
@@ -234,6 +241,183 @@ export async function startInstance(
   };
 }
 
+export interface ResilientClientOptions {
+  roomId: string;
+  /** Called once per connection attempt. A load balancer with no
+   * stickiness is modelled by returning a different instance each time. */
+  pickUrl: (attempt: number) => string;
+  doc?: Y.Doc;
+  random?: () => number;
+  policy?: ReconnectPolicy;
+  protocolVersion?: number;
+}
+
+/**
+ * A client that reconnects on its own, built on the same pure state machine
+ * the browser client will use (protocol/reconnect.ts), carrying its resume
+ * token across connections. Test-only for now; it exists to prove the whole
+ * loop: kill the socket, back off, land on a different instance, resume the
+ * identity, and resync only what was missed.
+ */
+export class ResilientClient {
+  readonly doc: Y.Doc;
+  readonly presence = new Map<string, PresenceValue>();
+  state: ConnectionState = { status: 'idle' };
+  clientId = '';
+  token: Uint8Array | null = null;
+  connectAttempts = 0;
+  /** One entry per completed handshake: was it a resume? */
+  readonly resumedFlags: boolean[] = [];
+  readonly closeCodes: number[] = [];
+  /** Bytes sent / received on the current connection, from HELLO onward. */
+  bytesSent = 0;
+  bytesReceived = 0;
+
+  #options: ResilientClientOptions;
+  #random: () => number;
+  #policy: ReconnectPolicy;
+  #ws: WebSocket | null = null;
+  #timer: NodeJS.Timeout | undefined;
+  #lastPresence: PresenceValue | null = null;
+  #onUpdate: (update: Uint8Array, origin: unknown) => void;
+  #closed = false;
+
+  constructor(options: ResilientClientOptions) {
+    this.#options = options;
+    this.doc = options.doc ?? new Y.Doc();
+    this.#random = options.random ?? Math.random;
+    this.#policy = options.policy ?? { baseMs: 10, capMs: 80, immediateJitterMs: 10 };
+    this.#onUpdate = (update, origin) => {
+      if (origin === 'remote' || this.state.status !== 'connected') return;
+      this.#send(encodeDocUpdate(update));
+    };
+    this.doc.on('update', this.#onUpdate);
+  }
+
+  get text(): string {
+    return this.doc.getText('content').toJSON();
+  }
+
+  start(): void {
+    this.#dispatch({ type: 'start' });
+  }
+
+  insert(index: number, text: string): void {
+    this.doc.getText('content').insert(index, text);
+  }
+
+  setPresence(value: PresenceValue): void {
+    this.#lastPresence = value;
+    if (this.state.status === 'connected') this.#send(encodePresenceUpdate(value));
+  }
+
+  /** Cuts the transport with no close handshake, like a dropped network. */
+  killSocket(): void {
+    this.#ws?.terminate();
+  }
+
+  manualReconnect(): void {
+    this.#dispatch({ type: 'manual-reconnect' });
+  }
+
+  async connected(timeoutMs = 5000): Promise<void> {
+    await waitUntil(() => this.state.status === 'connected', timeoutMs, 'client to be connected');
+  }
+
+  close(): void {
+    this.#closed = true;
+    clearTimeout(this.#timer);
+    this.doc.off('update', this.#onUpdate);
+    this.#ws?.close();
+  }
+
+  #dispatch(event: ConnectionEvent): void {
+    if (this.#closed) return;
+    const { state, effect } = step(this.state, event, this.#random, this.#policy);
+    this.state = state;
+    switch (effect.kind) {
+      case 'connect':
+        clearTimeout(this.#timer);
+        this.#open();
+        break;
+      case 'schedule-retry':
+        clearTimeout(this.#timer);
+        this.#timer = setTimeout(() => this.#dispatch({ type: 'retry-due' }), effect.delayMs);
+        break;
+      case 'cancel-retry':
+        clearTimeout(this.#timer);
+        break;
+      case 'none':
+        break;
+    }
+  }
+
+  #send(bytes: Uint8Array): void {
+    if (this.#ws?.readyState !== WebSocket.OPEN) return;
+    this.bytesSent += bytes.length;
+    this.#ws.send(bytes);
+  }
+
+  #open(): void {
+    this.connectAttempts += 1;
+    this.bytesSent = 0;
+    this.bytesReceived = 0;
+    const ws = new WebSocket(this.#options.pickUrl(this.connectAttempts));
+    this.#ws = ws;
+    ws.once('open', () => {
+      this.#send(
+        encodeHello(this.#options.roomId, this.#options.protocolVersion ?? PROTOCOL_VERSION, this.token ?? undefined),
+      );
+    });
+    ws.on('message', (data) => {
+      if (ws !== this.#ws) return;
+      const bytes = new Uint8Array(data as Buffer);
+      this.bytesReceived += bytes.length;
+      const msg = decode(bytes);
+      switch (msg.type) {
+        case MessageType.Welcome:
+          this.clientId = msg.clientId;
+          this.resumedFlags.push(msg.resumed);
+          this.#dispatch({ type: 'welcome' });
+          this.#send(encodeSyncStep1(Y.encodeStateVector(this.doc)));
+          // Presence is soft state that doesn't always survive a gap, so
+          // announce again on every connect. Cheap, and idempotent.
+          if (this.#lastPresence) this.#send(encodePresenceUpdate(this.#lastPresence));
+          break;
+        case MessageType.ResumeToken:
+          this.token = msg.token;
+          break;
+        case MessageType.SyncStep2:
+        case MessageType.DocUpdate:
+          Y.applyUpdate(this.doc, msg.update, 'remote');
+          break;
+        case MessageType.SyncStep1: {
+          const missing = Y.encodeStateAsUpdate(this.doc, msg.stateVector);
+          if (missing.length > EMPTY_UPDATE_BYTES) this.#send(encodeDocUpdate(missing));
+          break;
+        }
+        case MessageType.Ping:
+          this.#send(encodePong());
+          break;
+        case MessageType.PresenceBroadcast:
+          this.presence.set(msg.clientId, msg.value);
+          break;
+        case MessageType.PresenceRemove:
+          this.presence.delete(msg.clientId);
+          break;
+        default:
+          break;
+      }
+    });
+    ws.on('close', (code) => {
+      if (ws !== this.#ws) return; // a socket we've already replaced
+      this.closeCodes.push(code);
+      this.#dispatch({ type: 'closed', code });
+    });
+    ws.on('error', () => undefined); // surfaced as a close event
+  }
+}
+
 /** Stand-in for the Phase 6 browser client: a Yjs doc wired to the real
  * protocol. Reconnecting with the same `doc` models a client that kept its
  * local state (and any offline edits) across the gap. */
@@ -242,20 +426,30 @@ export class TestClient {
   readonly doc: Y.Doc;
   readonly presence = new Map<string, PresenceValue>();
   clientId = '';
+  resumed = false;
+  /** The latest resume token the server sent. */
+  token: Uint8Array | null = null;
+  /** Set once the socket closes. */
+  closeCode: number | null = null;
   ready: Promise<void>;
   #onUpdate: (update: Uint8Array, origin: unknown) => void;
 
-  constructor(url: string, roomId: string, doc: Y.Doc = new Y.Doc()) {
+  constructor(url: string, roomId: string, doc: Y.Doc = new Y.Doc(), resumeToken?: Uint8Array) {
     this.doc = doc;
     this.ws = new WebSocket(url);
+    this.ws.on('close', (code) => (this.closeCode = code));
     this.ready = new Promise((resolve) => {
-      this.ws.once('open', () => this.ws.send(encodeHello(roomId)));
+      this.ws.once('open', () => this.ws.send(encodeHello(roomId, PROTOCOL_VERSION, resumeToken)));
       this.ws.on('message', (data) => {
         const msg = decode(new Uint8Array(data as Buffer));
         switch (msg.type) {
           case MessageType.Welcome:
             this.clientId = msg.clientId;
+            this.resumed = msg.resumed;
             this.ws.send(encodeSyncStep1(Y.encodeStateVector(this.doc)));
+            break;
+          case MessageType.ResumeToken:
+            this.token = msg.token;
             break;
           case MessageType.SyncStep2:
             Y.applyUpdate(this.doc, msg.update, 'remote');
