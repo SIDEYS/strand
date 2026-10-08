@@ -10,6 +10,10 @@ import { Replicator } from './transport/replicator.js';
 const config = loadConfig();
 const logger = pino({ level: config.logLevel, base: { instanceId: config.instanceId } });
 
+if (config.resumeSecretIsEphemeral) {
+  logger.warn('RESUME_SECRET not set: using a throwaway secret, so resume tokens will not survive a restart');
+}
+
 const api = buildApiServer(logger);
 await api.ready();
 

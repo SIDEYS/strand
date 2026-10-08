@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
-function envInt(name: string, fallback: number): number {
-  const raw = process.env[name];
+function envInt(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name];
   if (raw === undefined || raw === '') return fallback;
   const parsed = Number.parseInt(raw, 10);
   if (Number.isNaN(parsed)) throw new Error(`invalid integer for ${name}: ${raw}`);
@@ -17,6 +17,15 @@ export interface Config {
   /** When unset the gateway runs standalone, with no cross-instance
    * fan-out; one instance behaves exactly as in Phases 1-2. */
   redisUrl: string | undefined;
+  /** HMAC key for resume tokens. Every instance in a deployment must share
+   * it, since any instance may be asked to honour a token another issued. */
+  resumeSecret: string;
+  /** True when no RESUME_SECRET was supplied and a throwaway one was
+   * generated, which only makes sense for a single standalone process. */
+  resumeSecretIsEphemeral: boolean;
+  /** How long a resume token stays valid. Short on purpose: it only has to
+   * outlast a reconnect, and it cannot be revoked once issued. */
+  resumeTtlMs: number;
   /** How often each instance announces its state per room so peers can
    * notice and repair anything fan-out dropped. This is the upper bound on
    * how long divergence can persist once the network is healthy again. */
@@ -40,19 +49,35 @@ export interface Config {
   logLevel: string;
 }
 
+const MIN_SECRET_CHARS = 32;
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const redisUrl = env.REDIS_URL || undefined;
+  const suppliedSecret = env.RESUME_SECRET || undefined;
+  if (suppliedSecret !== undefined && suppliedSecret.length < MIN_SECRET_CHARS) {
+    throw new Error(`RESUME_SECRET must be at least ${MIN_SECRET_CHARS} characters (try: openssl rand -base64 32)`);
+  }
+  if (redisUrl !== undefined && suppliedSecret === undefined) {
+    // A random per-process secret would make every instance reject tokens
+    // issued by the others, which only shows up as resumes quietly failing
+    // once a load balancer sends a client to a different instance.
+    throw new Error('RESUME_SECRET is required when REDIS_URL is set: all instances must share it');
+  }
   const config: Config = {
     host: env.HOST ?? '0.0.0.0',
-    port: envInt('PORT', 8080),
+    port: envInt(env, 'PORT', 8080),
     instanceId: env.INSTANCE_ID || randomUUID(),
-    redisUrl: env.REDIS_URL || undefined,
-    reconcileIntervalMs: envInt('RECONCILE_INTERVAL_MS', 5000),
-    joinSyncTimeoutMs: envInt('JOIN_SYNC_TIMEOUT_MS', 500),
-    presenceTtlMs: envInt('PRESENCE_TTL_MS', 45_000),
-    heartbeatIntervalMs: envInt('HEARTBEAT_INTERVAL_MS', 15_000),
-    heartbeatMaxMissedPongs: envInt('HEARTBEAT_MAX_MISSED_PONGS', 2),
-    backpressureThresholdBytes: envInt('BACKPRESSURE_THRESHOLD_BYTES', 1024 * 1024),
-    maxInboundMessageBytes: envInt('MAX_INBOUND_MESSAGE_BYTES', 65536),
+    redisUrl,
+    resumeSecret: suppliedSecret ?? randomUUID() + randomUUID(),
+    resumeSecretIsEphemeral: suppliedSecret === undefined,
+    resumeTtlMs: envInt(env, 'RESUME_TTL_MS', 5 * 60 * 1000),
+    reconcileIntervalMs: envInt(env, 'RECONCILE_INTERVAL_MS', 5000),
+    joinSyncTimeoutMs: envInt(env, 'JOIN_SYNC_TIMEOUT_MS', 500),
+    presenceTtlMs: envInt(env, 'PRESENCE_TTL_MS', 45_000),
+    heartbeatIntervalMs: envInt(env, 'HEARTBEAT_INTERVAL_MS', 15_000),
+    heartbeatMaxMissedPongs: envInt(env, 'HEARTBEAT_MAX_MISSED_PONGS', 2),
+    backpressureThresholdBytes: envInt(env, 'BACKPRESSURE_THRESHOLD_BYTES', 1024 * 1024),
+    maxInboundMessageBytes: envInt(env, 'MAX_INBOUND_MESSAGE_BYTES', 65536),
     logLevel: env.LOG_LEVEL ?? 'info',
   };
   if (config.presenceTtlMs < config.heartbeatIntervalMs * 2) {
