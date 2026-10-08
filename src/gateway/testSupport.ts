@@ -11,6 +11,11 @@ export function baseConfig(overrides: Partial<Config> = {}): Config {
   return {
     host: '127.0.0.1',
     port: 0,
+    instanceId: 'test-instance',
+    redisUrl: undefined,
+    reconcileIntervalMs: 5000,
+    joinSyncTimeoutMs: 500,
+    presenceTtlMs: 45_000,
     heartbeatIntervalMs: 10_000,
     heartbeatMaxMissedPongs: 2,
     backpressureThresholdBytes: 1024 * 1024,
