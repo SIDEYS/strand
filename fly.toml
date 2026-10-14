@@ -1,0 +1,52 @@
+# Strand on Fly.io: three or more identical machines behind Fly's proxy.
+# See docs/DEPLOYMENT.md for the commands that go with this file.
+#
+# Nothing here pins a client to a machine. Fly's proxy picks a machine per
+# connection and Strand does not need it to pick the same one twice: any
+# instance can serve any room and resume any session (ADRs 0002, 0003).
+
+app = "strand-REPLACE-ME" # app names are global; pick your own
+primary_region = "iad"
+
+[build]
+  # Uses ./Dockerfile.
+
+[env]
+  PORT = "8080"
+  LOG_LEVEL = "info"
+  # The WebSocket idle timeout of anything in front of Strand must stay well
+  # above this; the server pings at this interval.
+  HEARTBEAT_INTERVAL_MS = "15000"
+  # REDIS_URL, DATABASE_URL and RESUME_SECRET are secrets: `fly secrets set`.
+
+[deploy]
+  # Runs once per deploy, before any machine is replaced, with the app's
+  # secrets (so DATABASE_URL is available). Migrations are therefore never
+  # run by three instances racing at startup.
+  release_command = "node node_modules/node-pg-migrate/bin/node-pg-migrate.js up --migrations-dir migrations --migrations-table pgmigrations"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Collaborators hold sockets open for hours: never stop an idle machine.
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 3
+
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 4000
+    hard_limit = 5000
+
+  # /readyz, not /healthz: a machine that has lost Redis or Postgres should
+  # stop receiving NEW connections while keeping the sockets it already has.
+  [[http_service.checks]]
+    method = "GET"
+    path = "/readyz"
+    interval = "10s"
+    timeout = "3s"
+    grace_period = "20s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
