@@ -5,6 +5,7 @@
 // latency that belongs to the generator, and the report must be able to say so.
 import { spawn } from 'node:child_process';
 import { appendFileSync, writeFileSync } from 'node:fs';
+import { loadavg } from 'node:os';
 
 const KEEP = /^(strand_|process_resident_memory_bytes|process_cpu_seconds_total|nodejs_eventloop_lag|nodejs_heap_size_used_bytes)/;
 
@@ -19,6 +20,33 @@ export function parseProm(text) {
     out[m[1] + labels] = Number(m[3]);
   }
   return out;
+}
+
+/** What else the machine is doing. On a laptop the load generator and the
+ * system under test share CPUs with whatever the person is running, and a
+ * benchmark that does not record that cannot be trusted. Percentages are
+ * per-core (100 = one full core). The Docker VM itself is excluded: that is
+ * our own load. */
+export function hostBusy() {
+  return new Promise((resolve) => {
+    const child = spawn('ps', ['-Ao', 'pcpu=,comm=', '-r']);
+    let buf = '';
+    child.stdout.on('data', (d) => (buf += d));
+    child.on('error', () => resolve({ load1: loadavg()[0], otherCpu: 0, top: [] }));
+    child.on('close', () => {
+      const procs = buf
+        .split('\n')
+        .map((l) => /^\s*([\d.]+)\s+(.*)$/.exec(l))
+        .filter(Boolean)
+        .map((m) => ({ cpu: Number(m[1]), name: m[2].split('/').pop() }))
+        .filter((p) => !/Virtualization|^ps$|^node$|^docker/.test(p.name));
+      resolve({
+        load1: loadavg()[0],
+        otherCpu: procs.reduce((a, p) => a + p.cpu, 0),
+        top: procs.slice(0, 3),
+      });
+    });
+  });
 }
 
 function dockerStats() {
@@ -51,8 +79,9 @@ export function startSampler({ file, ports, intervalMs = 5000 }) {
   const tick = async () => {
     // Stamp before the slow `docker stats` call, not after: the metrics are read at the start.
     const stamped = Date.now();
-    const [docker, ...metrics] = await Promise.all([
+    const [docker, host, ...metrics] = await Promise.all([
       dockerStats(),
+      hostBusy(),
       ...ports.map(async (port) => {
         try {
           const res = await fetch(`http://127.0.0.1:${port}/metrics`, { signal: AbortSignal.timeout(3000) });
@@ -62,7 +91,7 @@ export function startSampler({ file, ports, intervalMs = 5000 }) {
         }
       }),
     ]);
-    appendFileSync(file, JSON.stringify({ t: stamped, since: stamped - t0, docker, instances: metrics }) + '\n');
+    appendFileSync(file, JSON.stringify({ t: stamped, since: stamped - t0, docker, host, instances: metrics }) + '\n');
   };
 
   const timer = setInterval(() => {

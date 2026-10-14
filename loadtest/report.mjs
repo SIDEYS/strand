@@ -99,6 +99,26 @@ const verify = existsSync(join(dir, 'verify.txt')) ? readFileSync(join(dir, 'ver
 line(`- integrity: ${verify.length ? verify.filter((l) => /INTEGRITY|lost|rooms read/.test(l)).join(' / ') : 'not checked'}`);
 line();
 
+// ---- host contention ------------------------------------------------------------------------------
+{
+  const others = samples.map((x) => x.host?.otherCpu).filter((x) => x !== undefined).sort((a, b) => a - b);
+  if (others.length === 0) {
+    line('> **Host contention was not recorded for this run** (it predates the recording), so latency tails here cannot be separated from other work on the machine.');
+  } else {
+    const med = others[Math.floor(others.length / 2)];
+    const names = new Map();
+    for (const x of samples) for (const p of x.host?.top ?? []) names.set(p.name, Math.max(names.get(p.name) ?? 0, p.cpu));
+    const heavy = [...names].filter(([, c]) => c >= 20).sort((a, b) => b[1] - a[1]).slice(0, 4).map(([n, c]) => `${n} (up to ${f(c, 0)}%)`);
+    const maxLoad = Math.max(...samples.map((x) => x.host?.load1 ?? 0));
+    line(
+      med > 100
+        ? `> **The host was contended: other processes used a median ${f(med, 0)}% of a core (100% = one core), load average up to ${f(maxLoad)}${heavy.length ? `, mostly ${heavy.join(', ')}` : ''}. Latency tails and any breaking point in this run include that contention.**`
+        : `> Host contention: other processes used a median ${f(med, 0)}% of a core (100% = one core), load average up to ${f(maxLoad)}${heavy.length ? `; heaviest: ${heavy.join(', ')}` : ''}.`,
+    );
+  }
+  line();
+}
+
 // ---- propagation --------------------------------------------------------------------------
 line('## End-to-end propagation latency (ms)');
 line();

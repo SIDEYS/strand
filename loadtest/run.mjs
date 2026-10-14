@@ -15,7 +15,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { startSampler } from './lib/sampler.mjs';
+import { hostBusy, startSampler } from './lib/sampler.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const scenario = process.argv[2];
@@ -65,6 +65,24 @@ const note = (what, extra = {}) => {
 };
 const sh = (cmd, args) => spawnSync(cmd, args, { cwd: root, encoding: 'utf8' });
 
+// A benchmark on a machine that is busy with something else measures the
+// machine. Look before starting, and refuse unless told to go ahead anyway.
+const hostBefore = [];
+for (let i = 0; i < 3; i++) {
+  hostBefore.push(await hostBusy());
+  await new Promise((r) => setTimeout(r, 2000));
+}
+const otherCpu = hostBefore.map((h) => h.otherCpu).sort((a, b) => a - b)[1];
+if (otherCpu > 100 && !process.argv.includes('--allow-busy')) {
+  console.error(
+    `refusing to run: other processes on this machine are using ${otherCpu.toFixed(0)}% of a core ` +
+      `(100% = one core), load average ${hostBefore[2].load1.toFixed(1)}. Heaviest: ` +
+      hostBefore[2].top.map((p) => `${p.name} ${p.cpu}%`).join(', ') +
+      '.\nClose them and retry, or pass --allow-busy to run anyway (the report will say the host was contended).',
+  );
+  process.exit(3);
+}
+
 if (!(await fetch('http://localhost:8080/readyz').then((r) => r.ok).catch(() => false))) {
   console.error('the stack is not up: run `docker compose up -d --build --wait` first');
   process.exit(1);
@@ -79,6 +97,7 @@ writeFileSync(
       failure: scenario === 'kill' ? failure : null,
       host: { docker: sh('docker', ['version', '--format', '{{.Server.Version}}']).stdout.trim(), cpus: sh('docker', ['info', '--format', '{{.NCPU}}']).stdout.trim(), memBytes: sh('docker', ['info', '--format', '{{.MemTotal}}']).stdout.trim() },
       gitCommit: sh('git', ['rev-parse', '--short', 'HEAD']).stdout.trim(),
+      hostBefore: { otherCpu, load1: hostBefore[2].load1, top: hostBefore[2].top },
     },
     null,
     2,
