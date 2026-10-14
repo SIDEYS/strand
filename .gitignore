@@ -9,3 +9,4 @@ web/node_modules/
 
 .env.*
 !.env.example
+loadtest/results/
