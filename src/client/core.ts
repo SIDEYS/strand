@@ -391,7 +391,12 @@ export class CollabClient {
     this.#socket = null;
     this.#clearWatchdogs();
     if (socket === null) return;
-    socket.onopen = socket.onmessage = socket.onclose = socket.onerror = null;
+    socket.onopen = socket.onmessage = socket.onclose = null;
+    // Not null: an abandoned socket can still report an error after we stopped
+    // caring. Node's `ws` emits one when a socket is terminated while it is
+    // still connecting, and an error event with no listener is an uncaught
+    // exception that takes the process down.
+    socket.onerror = () => undefined;
     try {
       if (socket.terminate) socket.terminate();
       else socket.close(code);
