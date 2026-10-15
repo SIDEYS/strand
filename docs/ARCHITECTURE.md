@@ -76,13 +76,13 @@ sequenceDiagram
   and cross-instance fan-out
     IA->>R: PUBLISH envelope {origin: 1, sentAt, update}
     R->>IB: envelope
-    IB->>IB: drop if origin is me; else apply
+    IB->>IB: drop if origin is me, otherwise apply
     IB->>B: DOC_UPDATE
   and persistence (origin only)
     IA->>IA: buffer op
     IA-)PG: flush op batch (~every 250 ms)
   end
-  Note over IA,IB: every ~5 s each instance publishes a state vector +<br/>delete-set digest per room; a peer that differs replies with<br/>exactly what the sender lacks. This is what makes lost<br/>pub/sub messages harmless.
+  Note over IA,IB: every ~5 s each instance publishes a state vector +<br/>delete-set digest per room, and a peer that differs replies with<br/>exactly what the sender lacks. This is what makes lost<br/>pub/sub messages harmless.
 ```
 
 Points worth noticing:

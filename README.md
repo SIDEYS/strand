@@ -6,8 +6,9 @@ A realtime collaborative Markdown editor built to run as several stateless
 server instances behind a load balancer, with no sticky sessions. Multiple
 people edit one document at once and see each other's cursors live.
 
-Work in progress; the final write-up (architecture diagram, interesting
-problems) arrives with the last phase. Benchmarks and operations are below.
+Sections below: [Quickstart](#quickstart), [Architecture](#architecture),
+[Interesting problems](#interesting-problems), [Benchmarks](#benchmarks),
+[Limitations](#limitations).
 
 ## Quickstart
 
@@ -28,6 +29,39 @@ To check the cluster from the command line instead:
 npm install && npm run build
 node loadtest/smoke.mjs        # two clients on different instances, edits cross both ways
 ```
+
+## Architecture
+
+```mermaid
+flowchart LR
+  B1[Browser A] & B2[Browser B] <-->|WebSocket<br/>binary protocol| LB[nginx<br/>round-robin]
+  subgraph S[Strand instances, all identical]
+    I1[instance 1]
+    I2[instance 2]
+    I3[instance 3]
+  end
+  LB <--> S
+  S <-->|pub/sub fan-out,<br/>presence, leases| R[(Redis)]
+  S -->|write-behind<br/>op log + snapshots| P[(Postgres)]
+```
+
+Each instance holds a full replica of every room it has a client in. An edit is
+applied locally, sent to that instance's other clients, published to Redis for
+the other instances, and logged to Postgres by the instance that received it. A
+periodic state-vector exchange between instances repairs anything pub/sub
+dropped. [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) has the path of one edit,
+the client's connection state machine, and a failure-mode table where every row
+says what proves it. Design decisions are recorded as ADRs:
+
+| ADR | Decision |
+|---|---|
+| [0001](docs/adr/0001-presence-lww-set.md) | Presence as a hand-rolled last-writer-wins set with server-stamped timestamps |
+| [0002](docs/adr/0002-fanout-pubsub-with-reconciliation.md) | Redis pub/sub for speed, state-vector reconciliation for correctness |
+| [0003](docs/adr/0003-stateless-resume-tokens-with-lease-fencing.md) | Stateless resume tokens; identity uniqueness enforced by a Redis lease |
+| [0004](docs/adr/0004-write-behind-persistence.md) | Write-behind persistence, logged once by the originating instance, snapshotted by any |
+| [0005](docs/adr/0005-shared-client-core-and-liveness.md) | One socket-agnostic client core shared by the browser and the tests |
+| [0006](docs/adr/0006-liveness-readiness-and-plain-round-robin.md) | Liveness is not readiness; the balancer is deliberately plain round-robin |
+| [0007](docs/adr/0007-binary-protocol-over-json.md) | A small binary protocol instead of JSON |
 
 ## No sticky sessions needed
 
@@ -231,6 +265,56 @@ tests and runs actually produced.
 The suites that involve timing were run repeatedly with no failures: the
 replication suite 20 times, the resume suites 20 times, and the persistence
 suites (24 tests) 15 times.
+
+## Interesting problems
+
+Things that were harder than they looked, and what was done about them.
+
+- **A deletion is invisible to a state vector.** The reconcile exchange
+  compares Yjs state vectors to find what a peer is missing, but a backspace
+  creates no new structs, so an instance that missed a deletion-only update has
+  the same vector as one that got it and would show deleted text forever. The
+  reconcile message also carries a 16-byte digest of the delete set, and a test
+  drops exactly a deletion-only update to prove it heals (ADR 0002).
+- **Which mechanism is load-bearing?** Pub/sub is the optimisation and
+  reconciliation is the correctness guarantee; the same shape recurs for session
+  leases, where the heartbeat's lease check is what guarantees one live
+  connection per identity and the fence message is only the fast path. For
+  several of these (the heartbeat lease check, the delete-set digest comparison,
+  the self-origin drop, the snapshot compare-and-swap) I removed the mechanism
+  and confirmed a test fails, because a test that passes only because something
+  else covers for it is worse than none.
+- **A test that proved nothing.** A snapshot-shrink bug was masked by the op
+  log still holding the lost data, so the test passed. Compacting the log away
+  first made it fail, and that sharper test is the one that stayed.
+- **Clients cannot be trusted with a clock.** Presence is a last-writer-wins
+  set, which is only as correct as its timestamps; a client-supplied one would
+  let a fast clock win every conflict. The server stamps every presence update,
+  and session leases use Redis's `TIME` inside the Lua script, so no instance's
+  or client's clock decides anything (ADR 0001).
+- **One identity, two instances.** Without sticky sessions, the same resume
+  token can arrive at two instances. A stateless signed token is cheap to
+  verify anywhere, but it cannot enforce uniqueness, so a short Redis lease does
+  that and fences the older connection (ADR 0003). While Redis is down the check
+  can only see one instance; that degradation is chosen and documented below.
+- **Measuring found a bug the tests did not.** A reconnecting client was sent
+  its whole 100 KB document twice. It converged either way, so no assertion
+  failed; a byte count caught it. The server now withholds live updates until it
+  has answered the client's state vector.
+- **Round-robin that wasn't.** With nginx's default per-worker state, each
+  worker round-robined on its own and traffic clustered on the first instance.
+  A shared `zone` fixed it, and the smoke test now insists on landing on two
+  different instances before it checks anything.
+- **Compaction safety is a timing assumption.** Trimming the op log is safe only
+  if every instance holding a change snapshots within a bounded time. I could
+  not turn that into a proof, so ADR 0004 names the narrow conditions under which
+  a change could be lost instead of calling it safe.
+- **Benchmarks on a shared laptop.** Chasing a breaking point, I found the load
+  generator, the Docker VM and the person's other applications all competing for
+  the same cores, and that my own generator saturated first. The runner now
+  records what else the machine is doing, refuses to start on a busy one, and
+  prints the generator's own timer lateness so a report can say when it was
+  measuring itself.
 
 ## Operating it
 
