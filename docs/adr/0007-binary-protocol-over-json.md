@@ -17,8 +17,8 @@ other field then also needs a decision about numbers and escaping.
 **A schema-based binary format (Protocol Buffers, MessagePack, CBOR).** Real
 options, and for a larger protocol I would reach for one. For roughly a dozen
 message types with one binary blob each, a dependency plus a build step (or a
-runtime library shipped to every browser) buys little over thirty lines of
-length-prefixed encoding, and adds a surface the codec's own tests would have
+runtime library shipped to every browser) buys little over a small hand-written
+length-prefixed codec, and adds a surface the codec's own tests would have
 to treat as a black box.
 
 **Hand-rolled binary: one type byte, then a payload per type** (chosen). The
@@ -56,8 +56,8 @@ would differ in detail but not in kind):
 | Presence update (name, colour, no cursor) | 23 B | 94 B |
 | Ping | 1 B | 15 B |
 
-Document updates dominate traffic and the saving there is roughly 40 to 60% on
-small edits. It is not an order of magnitude; the honest case for binary here is
+Document updates dominate traffic and the frame is 48 to 64% smaller on the
+small edits measured above. It is not an order of magnitude; the honest case for binary here is
 "smaller, cheaper to parse, and no base64 round trip for a payload that is
 already bytes", not "JSON would not work".
 
