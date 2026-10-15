@@ -261,6 +261,13 @@ tests and runs actually produced.
 - **The integration suites drive the shipped client core**, not a test-only
   reimplementation. Deliberately breaking the core's handover of offline edits
   fails three real-infrastructure tests.
+- **Two real browser windows on the compose stack, across instances** (checked
+  by hand at the end of the build, not by an automated test, and on localhost, not
+  a deployed URL). The windows landed on different instances and a typed edit
+  appeared in the other immediately. With nginx frozen so both sockets went
+  silent, each window said Offline after about 23 s, I typed in both at the same
+  position, and after nginx was unfrozen both reconnected within about 3 s and
+  rendered identical text containing both offline edits.
 
 The suites that involve timing were run repeatedly with no failures: the
 replication suite 20 times, the resume suites 20 times, and the persistence
